@@ -80,10 +80,15 @@ is
 
   `series_out[k-1] = f^(k)(x₀) / k!`.
 
-To recover the unscaled `k`-th derivative, multiply by `k!`. (This differs
-from `jax.experimental.jet`, which returns derivative coefficients without
-the factorial scaling. The relationship is documented and tested in
-`tests/test_against_jax_jet.py`.)
+To recover the unscaled `k`-th derivative, multiply by `k!`. This is the
+convention used in *Evaluating Derivatives* (Griewank & Walther, §13).
+
+`jax.experimental.jet` exposes both conventions through its
+`factorial_scaled` keyword argument (defaults to `True`, returning
+derivative coefficients `f^(k)(x₀)`). Calling
+`jax.experimental.jet.jet(..., factorial_scaled=False)` returns the same
+Taylor coefficients as `jet_array`. The equivalence is tested
+coefficient-by-coefficient in `tests/test_against_jax_jet.py`.
 
 ## Examples
 
@@ -227,13 +232,27 @@ combine with `jax.vmap`.
 
 ### Caveats
 
-- Only primitives in `_rules_with_effective_order` honor the hint. Other
-  primitives compute the full series. So for a function like `sin(x)`
-  alone, `effective_order` has no effect — `sin` always computes all `K`
-  coefficients.
-- Output entries with index `≥ effective_order` are not guaranteed to
-  contain anything specific (zero, garbage, or a partial answer). Slice
-  to `series_out[:effective_order]` before using them.
+- The primitives a JAX program uses fall into three categories:
+  - **Linear / zero-derivative** (`add`, `sub`, multiplication by a
+    constant, `neg`, broadcasting, slicing, comparisons, …): the operation
+    applies elementwise along the order axis — `(a + b)[k] = a[k] + b[k]`
+    — so it is already a single `O(K)` XLA op over the series array.
+    There is no convolution loop to short-circuit, and `effective_order`
+    has no effect. (Output entries above `effective_order` still hold
+    correct values for these primitives, because the linear op computes
+    every entry uniformly.)
+  - **Nonlinear without an `effective_order`-aware rule** (`sin`, `cos`,
+    `sinh`, `cosh`, `square`, `sqrt`, `erf`, …): the rule computes the
+    full `O(K²)` convolution regardless. `effective_order` is silently
+    ignored on this path.
+  - **Nonlinear with an `effective_order`-aware rule** (`exp`, `expm1`,
+    `log`, `log1p`, `pow`, `logistic`, `tanh`, `erf_inv`, `div`): the
+    convolution scan short-circuits iterations beyond `effective_order`.
+    Output entries above `effective_order` are unspecified — slice to
+    `series_out[:effective_order]` before using them.
+- Because output entries above `effective_order` are unspecified for the
+  third category, treat the whole `series_out[effective_order:]` slice as
+  garbage even if upstream linear ops would otherwise leave it intact.
 - The win is largest when the dominant cost is in the convolution-style
   loops that the hint short-circuits. For shallow programs the overhead of
   the conditional may exceed the savings.

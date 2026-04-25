@@ -1,19 +1,12 @@
 """Correctness tests against ``jax.experimental.jet``.
 
-``jax.experimental.jet`` returns derivative coefficients
-``[f(x), f'(x), f''(x), f'''(x), ...]``; ``jet_array`` returns Taylor
-coefficients ``[f(x), f'(x), f''(x)/2!, f'''(x)/3!, ...]``. So the
-relationship is::
-
-    jet_array_series[k] == standard_jet_series[k] / (k+1)!  for k = 0, 1, ...
-
-(Note the index shift: ``standard_jet`` returns the primal as
-``series[0]`` only when the user requests it; in our framing
-``primal_out`` is returned separately and ``series_out[k]`` is the
-``(k+1)``-th coefficient.)
-
-Each test scales the standard-jet output by 1/k! and compares against
-``jet_array`` to within tight tolerance.
+Both libraries return Taylor coefficients ``[f'(x)/1!, f''(x)/2!, ...]``
+when invoked with matching conventions. ``jet_array.jet`` always uses
+this convention; ``jax.experimental.jet.jet`` returns it when called
+with ``factorial_scaled=False`` (with default ``True`` it returns the
+unscaled derivative coefficients ``[f'(x), f''(x), ...]``). These tests
+exercise the matching path and assert coefficient-by-coefficient
+equivalence.
 """
 
 import math
@@ -35,11 +28,6 @@ RTOL = 1e-5
 ATOL = 1e-5
 
 
-def _scale_to_taylor(series_in_deriv):
-    """Convert standard-jet derivative coefficients to Taylor coefficients."""
-    return [coeff / math.factorial(k + 1) for k, coeff in enumerate(series_in_deriv)]
-
-
 def _compare(name, x0, fn, order=5):
     """Compare jet_array.jet against jax.experimental.jet at one point."""
     x0_arr = jnp.asarray(x0, dtype=jnp.float64)
@@ -47,14 +35,15 @@ def _compare(name, x0, fn, order=5):
     p_arr, s_arr = jet(fn, (x0_arr,), (series_in_arr,))
 
     series_in_std = [1.0] + [0.0] * (order - 1)
-    p_std, s_std = standard_jet.jet(fn, (x0_arr,), (series_in_std,))
-    s_std_taylor = _scale_to_taylor(s_std)
+    p_std, s_std = standard_jet.jet(
+        fn, (x0_arr,), (series_in_std,), factorial_scaled=False
+    )
 
     np.testing.assert_allclose(
         p_arr, p_std, rtol=RTOL, atol=ATOL,
         err_msg=f"{name}@{x0}: primal mismatch",
     )
-    for k, (a, b) in enumerate(zip(s_arr, s_std_taylor)):
+    for k, (a, b) in enumerate(zip(s_arr, s_std)):
         np.testing.assert_allclose(
             a, b, rtol=RTOL, atol=ATOL,
             err_msg=f"{name}@{x0}: coefficient {k+1} mismatch",
@@ -92,11 +81,12 @@ def test_multivariate_matches_standard_jet(name, fn, order):
 
     sx_std = [1.0] + [0.0] * (order - 1)
     sy_std = [1.0] + [0.0] * (order - 1)
-    p_std, s_std = standard_jet.jet(fn, (x0, y0), (sx_std, sy_std))
-    s_std_taylor = _scale_to_taylor(s_std)
+    p_std, s_std = standard_jet.jet(
+        fn, (x0, y0), (sx_std, sy_std), factorial_scaled=False
+    )
 
     np.testing.assert_allclose(p_arr, p_std, rtol=RTOL, atol=ATOL)
-    for k, (a, b) in enumerate(zip(s_arr, s_std_taylor)):
+    for k, (a, b) in enumerate(zip(s_arr, s_std)):
         np.testing.assert_allclose(
             a, b, rtol=RTOL, atol=ATOL,
             err_msg=f"{name}: coefficient {k+1} mismatch",
