@@ -8,7 +8,6 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
     { name = "Cambridge Yang", email = "camyang@csail.mit.edu" },
-    { name = "Dongdong Li", email = "dli.stats@gmail.com" },
 ]
 keywords = ["jax", "automatic-differentiation", "taylor-mode", "jet", "higher-order-derivatives"]
 classifiers = [

@@ -280,7 +280,7 @@ If you use `jet-array` in academic work, please cite the repository:
 ```bibtex
 @software{jet_array,
   title  = {jet-array: array-form Taylor-mode automatic differentiation in JAX},
-  author = {Yang, Cambridge and Li, Dongdong},
+  author = {Yang, Cambridge},
   year   = {2026},
   url    = {https://github.com/thisiscam/jet-array},
 }

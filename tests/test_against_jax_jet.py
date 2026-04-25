@@ -151,3 +151,26 @@ def test_identity():
     np.testing.assert_allclose(p, 0.7)
     np.testing.assert_allclose(s[0], 1.0)
     np.testing.assert_allclose(s[1:], jnp.zeros(4), atol=1e-7)
+
+
+@pytest.mark.parametrize("name,fn", TEST_FUNCTION_PARAMS)
+def test_python_float_primal(name, fn):
+    """Python float primals are promoted to jnp arrays automatically.
+
+    Regression test: rules like _log1p_taylor previously called .ndim on the
+    primal, which failed for Python floats.
+    """
+    if name == "log1p":
+        x0 = 0.3
+    else:
+        x0 = 0.5
+    order = 5
+    series_in = [1.0] + [0.0] * (order - 1)
+    primal, series = jet(fn, (x0,), (series_in,))
+    # Compare against the jnp-array path.
+    series_in_arr = jnp.zeros(order, dtype=jnp.float64).at[0].set(1.0)
+    primal_ref, series_ref = jet(
+        fn, (jnp.asarray(x0, dtype=jnp.float64),), (series_in_arr,)
+    )
+    np.testing.assert_allclose(primal, primal_ref, rtol=RTOL, atol=ATOL)
+    np.testing.assert_allclose(series, series_ref, rtol=RTOL, atol=ATOL)

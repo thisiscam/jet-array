@@ -206,6 +206,11 @@ def jet(fun, primals, series, effective_order=None, **_):
             if not treedef_is_leaf(treedef):
                 raise ValueError(f"term {j} for argument {i} is not an array")
 
+    # Promote Python scalars to jnp arrays so that primitive rules can rely
+    # on .ndim/.shape/.dtype.
+    primals = tuple(jnp.asarray(p) for p in primals)
+    series = tuple(jnp.asarray(s) for s in series)
+
     @lu.transformation_with_aux2
     def flatten_fun_output(f, store, *args):
         ans = f(*args)
