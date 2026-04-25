@@ -502,36 +502,66 @@ def def_deriv(prim, deriv):
     Define the jet rule for a primitive in terms of its first derivative.
     """
     jet_rules[prim] = partial(deriv_prop, prim, deriv)
+    _register_eff_order_rule(prim)
 
 
-def deriv_prop(prim, deriv, primals_in, series_in):
+def deriv_prop(prim, deriv, primals_in, series_in, _jet_effective_order=None):
     (x,) = primals_in
     (series,) = series_in
     primal_out = prim.bind(x)
-    c0, cs = jet(deriv, primals_in, series_in)
-    tail = _deriv_prop_propagate(c0, cs, x, series)
+    c0, cs = jet(deriv, primals_in, series_in,
+                 effective_order=_jet_effective_order)
+    tail = _deriv_prop_propagate(c0, cs, x, series,
+                                 effective_order=_jet_effective_order)
     return primal_out, tail
 
 
-def _deriv_prop_propagate(c0, cs, x, series):
+def _deriv_prop_propagate(c0, cs, x, series, effective_order=None):
     c = _prepend_primal(c0, cs)
     u = _prepend_primal(x, series)
-    u_scaled = jnp.arange(u.shape[0]) * u
-    u_pad = jnp.pad(
-        u_scaled,
-        ((len(c) - 1, 0),) + ((0, 0),) * (u.ndim - 1),
-        mode="constant",
-        constant_values=0,
-    )
-    full = lax.conv_general_dilated(
-        u_pad[None, None, :],
-        c[::-1][None, None, :],
-        window_strides=(1,),
-        padding="VALID",
-        dimension_numbers=("NCW", "IOW", "NCW"),
-    )[0, 0]
-    v_tail = full[1 : len(u)] / jnp.arange(1, len(u))
-    return v_tail
+
+    if effective_order is None:
+        # Fast path: single fused conv, optimal for full-K computation.
+        u_scaled = jnp.arange(u.shape[0]) * u
+        u_pad = jnp.pad(
+            u_scaled,
+            ((len(c) - 1, 0),) + ((0, 0),) * (u.ndim - 1),
+            mode="constant",
+            constant_values=0,
+        )
+        full = lax.conv_general_dilated(
+            u_pad[None, None, :],
+            c[::-1][None, None, :],
+            window_strides=(1,),
+            padding="VALID",
+            dimension_numbers=("NCW", "IOW", "NCW"),
+        )[0, 0]
+        return full[1 : len(u)] / jnp.arange(1, len(u))
+
+    # Scan path: same Faà di Bruno recurrence
+    #   v[k] = (1/k) * sum_{j=1..k} j * u[j] * c[k-j]
+    # rewritten as a scan body so _jet_scan can short-circuit iterations
+    # k > effective_order.
+    n = u.shape[0]
+    if n == 1:
+        return jnp.zeros_like(series)
+
+    j_idx = jnp.arange(n, dtype=u.dtype).reshape((n,) + (1,) * (u.ndim - 1))
+    u_scaled = j_idx * u
+    pad_width = [(n - 2, 0)] + [(0, 0)] * (u.ndim - 1)
+    u_pad = jnp.pad(u_scaled, pad_width, mode="constant")[::-1]
+
+    v = jnp.zeros_like(u)
+
+    def body(v_acc, k):
+        u_slice = lax.dynamic_slice_in_dim(u_pad, n - 1 - k, n - 1, axis=0)
+        v_k = jnp.einsum("i...,i...->...", c[:-1], u_slice) / k
+        v_acc = v_acc.at[k].set(v_k)
+        return v_acc, None
+
+    v_final, _ = _jet_scan(body, v, jnp.arange(1, n, dtype=jnp.int32),
+                           effective_order)
+    return v_final[1:]
 
 
 def_deriv(

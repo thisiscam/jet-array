@@ -238,20 +238,25 @@ combine with `jax.vmap`.
     applies elementwise along the order axis — `(a + b)[k] = a[k] + b[k]`
     — so it is already a single `O(K)` XLA op over the series array.
     There is no convolution loop to short-circuit, and `effective_order`
-    has no effect. (Output entries above `effective_order` still hold
+    has no effect. Output entries above `effective_order` still hold
     correct values for these primitives, because the linear op computes
-    every entry uniformly.)
-  - **Nonlinear without an `effective_order`-aware rule** (`sin`, `cos`,
-    `sinh`, `cosh`, `square`, `sqrt`, `erf`, …): the rule computes the
+    every entry uniformly.
+  - **Nonlinear with an `effective_order`-aware rule.** Currently
+    `exp`, `expm1`, `log`, `log1p`, `pow`, `logistic`, `tanh`, `erf_inv`,
+    `div`, `sin`, `cos`, `sinh`, `cosh`, `mul`, `dot_general`,
+    `conv_general_dilated`, `erf`, and any future `def_deriv`-registered
+    primitive. The convolution scan short-circuits iterations beyond
+    `effective_order`. Output entries above `effective_order` are
+    unspecified — slice to `series_out[:effective_order]` before using
+    them.
+  - **Nonlinear without an `effective_order`-aware rule.** A few rules
+    (`abs`, `max`, `min`, `atan2`, `integer_pow`, `cumprod`, `cummax`,
+    `cummin`, the `reduce_*` family, `scatter-add`) currently compute the
     full `O(K²)` convolution regardless. `effective_order` is silently
-    ignored on this path.
-  - **Nonlinear with an `effective_order`-aware rule** (`exp`, `expm1`,
-    `log`, `log1p`, `pow`, `logistic`, `tanh`, `erf_inv`, `div`): the
-    convolution scan short-circuits iterations beyond `effective_order`.
-    Output entries above `effective_order` are unspecified — slice to
-    `series_out[:effective_order]` before using them.
+    ignored on this path. These can be made aware with the same
+    `_jet_scan` plumbing as the others — see the source for the pattern.
 - Because output entries above `effective_order` are unspecified for the
-  third category, treat the whole `series_out[effective_order:]` slice as
+  second category, treat the whole `series_out[effective_order:]` slice as
   garbage even if upstream linear ops would otherwise leave it intact.
 - The win is largest when the dominant cost is in the convolution-style
   loops that the hint short-circuits. For shallow programs the overhead of
