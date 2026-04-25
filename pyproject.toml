@@ -1,0 +1,45 @@
+[project]
+name = "jet-array"
+version = "0.1.0"
+description = "Array-form Taylor-mode automatic differentiation in JAX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Cambridge Yang", email = "camyang@csail.mit.edu" },
+    { name = "Dongdong Li", email = "dli.stats@gmail.com" },
+]
+keywords = ["jax", "automatic-differentiation", "taylor-mode", "jet", "higher-order-derivatives"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "jax>=0.8,<0.9",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/thisiscam/jet-array"
+Repository = "https://github.com/thisiscam/jet-array"
+Issues = "https://github.com/thisiscam/jet-array/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jet_array"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
