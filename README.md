@@ -233,45 +233,13 @@ batched = jax.vmap(taylor)(xs, ks)
 
 ### Caveats
 
-- `effective_order` propagates across both explicit (`jax.jit`) and
-  implicit (`jnp.*` operator) jit boundaries. The implementation binds
-  `effective_order` as an extra runtime input to each inner pjit so the
-  inner `JetTrace` reads it as a tracer and threads it into every
-  primitive rule's `_jet_scan` call. No special action needed from the
-  user — write your function in plain `jnp` style and the hint is
-  honored throughout.
-- The primitives a JAX program uses fall into three categories:
-  - **Linear / zero-derivative** (`add`, `sub`, multiplication by a
-    constant, `neg`, broadcasting, slicing, comparisons, …): the operation
-    applies elementwise along the order axis — `(a + b)[k] = a[k] + b[k]`
-    — so it is already a single `O(K)` XLA op over the series array.
-    There is no convolution loop to short-circuit, and `effective_order`
-    has no effect. Output entries above `effective_order` still hold
-    correct values for these primitives, because the linear op computes
-    every entry uniformly.
-  - **Nonlinear with an `effective_order`-aware rule.** Currently
-    `exp`, `expm1`, `log`, `log1p`, `pow`, `integer_pow`, `logistic`,
-    `tanh`, `erf_inv`, `div`, `sin`, `cos`, `sinh`, `cosh`, `mul`,
-    `dot_general`, `conv_general_dilated`, `erf`, `atan2`, `cumprod`,
-    `cummax`, `cummin`, and any future `def_deriv`-registered primitive.
-    The convolution scan short-circuits iterations beyond
-    `effective_order`. Output entries above `effective_order` are
-    unspecified — slice to `series_out[:effective_order]` before using
-    them.
-  - **Linear-style fan-out rules** (`abs`, `max`, `min`, `gather`,
-    `select_n`, `scatter-add`, `reduce_max`, `reduce_min`): each rule
-    applies an op independently to every series index via `vmap`, the
-    same shape as `add`/`sub` in the linear bucket. They don't
-    short-circuit, but they don't need to — the per-entry cost is O(1)
-    and the contract is satisfied because garbage-in-garbage-out for
-    indices above `effective_order` is fine.
-- One-time cost: when `effective_order` is set, each inner pjit re-traces
-  with one extra input (the eff scalar). This adds a small compile-time
-  cost the first time a function is `jet`'d with `effective_order` set vs
-  without — both jaxprs are cached.
-- Because output entries above `effective_order` are unspecified for the
-  second category, treat the whole `series_out[effective_order:]` slice as
-  garbage even if upstream linear ops would otherwise leave it intact.
+- Slice the result to `series_out[:effective_order]`. Entries above the
+  threshold are unspecified.
+- `effective_order` works through `jax.jit` and `jnp.*` automatically.
+  No need to rewrite your function in `lax.*` style.
+- The savings come from short-circuiting the `O(K²)` convolutions in
+  nonlinear rules. Linear ops (`add`, `broadcast`, `reshape`, …) are
+  already `O(K)` and unaffected.
 - The win is largest when the dominant cost is in the convolution-style
   loops that the hint short-circuits. For shallow programs the overhead of
   the conditional may exceed the savings.
