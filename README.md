@@ -1,5 +1,10 @@
 # jet-array
 
+> **Status: experimental (pre-alpha).** API and semantics may change without
+> notice. The package depends on `jax._src` internals; the JAX version pin
+> may tighten or widen as JAX evolves. Install with `pip install jet-array
+> --pre`, since `pip` does not pick up pre-release versions by default.
+
 Array-form Taylor-mode automatic differentiation in JAX.
 
 `jet_array` propagates a truncated Taylor polynomial of order `K` through an
@@ -41,7 +46,7 @@ faster — Taylor-mode pays only when `K ≥ ~3`.
 ## Install
 
 ```bash
-pip install jet-array
+pip install jet-array --pre
 ```
 
 `jet_array` uses `jax._src` internals and is currently tested on

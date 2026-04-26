@@ -1,6 +1,6 @@
 [project]
 name = "jet-array"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "Array-form Taylor-mode automatic differentiation in JAX"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,7 +11,7 @@ authors = [
 ]
 keywords = ["jax", "automatic-differentiation", "taylor-mode", "jet", "higher-order-derivatives"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
