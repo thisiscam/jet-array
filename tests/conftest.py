@@ -49,3 +49,25 @@ EDGE_CASE_PARAMS = [
     ('large_positive', 5.0),
     ('large_negative', -5.0),
 ]
+
+
+# Per-function domain filters. Functions with restricted domains exclude the
+# EDGE_CASE_PARAMS points where they're undefined, so the test matrix never
+# generates a case that would just be skipped.
+_DOMAIN_FILTERS = {
+    'log1p': lambda x: x > -1.0,
+}
+
+
+def expand_univariate_cases():
+    """Cross TEST_FUNCTION_PARAMS with EDGE_CASE_PARAMS, filtering each
+    function to its valid domain. Returns a list of
+    (name, fn, point_name, x0) tuples ready to feed to pytest.parametrize.
+    """
+    cases = []
+    for name, fn in TEST_FUNCTION_PARAMS:
+        valid = _DOMAIN_FILTERS.get(name, lambda x: True)
+        for pname, x in EDGE_CASE_PARAMS:
+            if valid(x):
+                cases.append((name, fn, pname, x))
+    return cases

@@ -20,7 +20,7 @@ from jet_array import jet
 from conftest import (
     TEST_FUNCTION_PARAMS,
     MULTIVARIATE_TEST_PARAMS,
-    EDGE_CASE_PARAMS,
+    expand_univariate_cases,
 )
 
 
@@ -50,21 +50,14 @@ def _compare(name, x0, fn, order=5):
         )
 
 
-@pytest.mark.parametrize("name,fn", TEST_FUNCTION_PARAMS)
-@pytest.mark.parametrize("point_name,x0", EDGE_CASE_PARAMS)
+@pytest.mark.parametrize("name,fn,point_name,x0", expand_univariate_cases())
 @pytest.mark.parametrize("order", [1, 2, 3, 5, 8])
 def test_univariate_matches_standard_jet(name, fn, point_name, x0, order):
-    """jet_array agrees with jax.experimental.jet for univariate functions."""
-    # Skip points where the function is undefined / non-finite.
-    if name in {"log1p"} and x0 <= -1.0:
-        pytest.skip(f"{name} undefined at {x0}")
-    try:
-        y = float(fn(jnp.float32(x0)))
-        if not np.isfinite(y):
-            pytest.skip(f"{name} non-finite at {x0}")
-    except Exception:
-        pytest.skip(f"{name} fails at {x0}")
+    """jet_array agrees with jax.experimental.jet for univariate functions.
 
+    Cases are pre-filtered to each function's valid domain (see
+    conftest._DOMAIN_FILTERS), so this never generates an undefined call.
+    """
     _compare(name, x0, fn, order=order)
 
 
