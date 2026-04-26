@@ -479,7 +479,8 @@ jet_rules[lax.dynamic_update_slice_p] = _dynamic_update_slice_jet_rule
 
 
 def _cumulative_jet_rule(
-    primals_in, series_in, *, axis: int, reverse: bool, combine_fn: Callable
+    primals_in, series_in, *, axis: int, reverse: bool, combine_fn: Callable,
+    _jet_effective_order=None,
 ):
     # Irrespective of backend, we always use the parallel prefix scan
     # implementation when differentiating because reduce_window is not
@@ -488,6 +489,7 @@ def _cumulative_jet_rule(
         partial(lax.associative_scan, combine_fn, axis=axis, reverse=reverse),
         primals_in,
         series_in,
+        effective_order=_jet_effective_order,
     )
 
 
@@ -495,6 +497,8 @@ deflinear(lax.cumsum_p)
 jet_rules[lax.cumprod_p] = partial(_cumulative_jet_rule, combine_fn=lax.mul)
 jet_rules[lax.cummax_p] = partial(_cumulative_jet_rule, combine_fn=lax.max)
 jet_rules[lax.cummin_p] = partial(_cumulative_jet_rule, combine_fn=lax.min)
+for _p in (lax.cumprod_p, lax.cummax_p, lax.cummin_p):
+    _register_eff_order_rule(_p)
 
 
 def def_deriv(prim, deriv):
@@ -799,14 +803,17 @@ def _pow_by_squaring(x, n):
         return x * _pow_by_squaring(x * x, (n - 1) / 2)
 
 
-def _integer_pow_taylor(primals_in, series_in, *, y):
+def _integer_pow_taylor(primals_in, series_in, *, y, _jet_effective_order=None):
     if y == 0:
-        return jet(jnp.ones_like, primals_in, series_in)
+        return jet(jnp.ones_like, primals_in, series_in,
+                   effective_order=_jet_effective_order)
     else:
-        return jet(lambda x: _pow_by_squaring(x, y), primals_in, series_in)
+        return jet(lambda x: _pow_by_squaring(x, y), primals_in, series_in,
+                   effective_order=_jet_effective_order)
 
 
 jet_rules[lax.integer_pow_p] = _integer_pow_taylor
+_register_eff_order_rule(lax.integer_pow_p)
 
 
 def _logistic_taylor(primals_in, series_in, _jet_effective_order=None, **_):
@@ -924,18 +931,22 @@ jet_rules[lax.log_p] = _log_taylor
 _register_eff_order_rule(lax.log_p)
 
 
-def _atan2_taylor(primals_in, series_in):
+def _atan2_taylor(primals_in, series_in, _jet_effective_order=None):
     x, y = primals_in
     primal_out = lax.atan2(x, y)
 
-    x, series = jet(lax.div, primals_in, series_in)
+    x, series = jet(lax.div, primals_in, series_in,
+                    effective_order=_jet_effective_order)
     one = lax_internal._const(x, 1)
-    c0, cs = jet(lambda x: lax.div(one, 1 + lax.square(x)), (x,), (series,))
-    tail = _deriv_prop_propagate(c0, cs, x, series)
+    c0, cs = jet(lambda x: lax.div(one, 1 + lax.square(x)), (x,), (series,),
+                 effective_order=_jet_effective_order)
+    tail = _deriv_prop_propagate(c0, cs, x, series,
+                                 effective_order=_jet_effective_order)
     return primal_out, tail
 
 
 jet_rules[lax.atan2_p] = _atan2_taylor
+_register_eff_order_rule(lax.atan2_p)
 
 
 def _div_taylor_rule(primals_in, series_in, _jet_effective_order=None, **_):

@@ -242,19 +242,21 @@ combine with `jax.vmap`.
     correct values for these primitives, because the linear op computes
     every entry uniformly.
   - **Nonlinear with an `effective_order`-aware rule.** Currently
-    `exp`, `expm1`, `log`, `log1p`, `pow`, `logistic`, `tanh`, `erf_inv`,
-    `div`, `sin`, `cos`, `sinh`, `cosh`, `mul`, `dot_general`,
-    `conv_general_dilated`, `erf`, and any future `def_deriv`-registered
-    primitive. The convolution scan short-circuits iterations beyond
+    `exp`, `expm1`, `log`, `log1p`, `pow`, `integer_pow`, `logistic`,
+    `tanh`, `erf_inv`, `div`, `sin`, `cos`, `sinh`, `cosh`, `mul`,
+    `dot_general`, `conv_general_dilated`, `erf`, `atan2`, `cumprod`,
+    `cummax`, `cummin`, and any future `def_deriv`-registered primitive.
+    The convolution scan short-circuits iterations beyond
     `effective_order`. Output entries above `effective_order` are
     unspecified — slice to `series_out[:effective_order]` before using
     them.
-  - **Nonlinear without an `effective_order`-aware rule.** A few rules
-    (`abs`, `max`, `min`, `atan2`, `integer_pow`, `cumprod`, `cummax`,
-    `cummin`, the `reduce_*` family, `scatter-add`) currently compute the
-    full `O(K²)` convolution regardless. `effective_order` is silently
-    ignored on this path. These can be made aware with the same
-    `_jet_scan` plumbing as the others — see the source for the pattern.
+  - **Linear-style fan-out rules** (`abs`, `max`, `min`, `gather`,
+    `select_n`, `scatter-add`, `reduce_max`, `reduce_min`): each rule
+    applies an op independently to every series index via `vmap`, the
+    same shape as `add`/`sub` in the linear bucket. They don't
+    short-circuit, but they don't need to — the per-entry cost is O(1)
+    and the contract is satisfied because garbage-in-garbage-out for
+    indices above `effective_order` is fine.
 - Because output entries above `effective_order` are unspecified for the
   second category, treat the whole `series_out[effective_order:]` slice as
   garbage even if upstream linear ops would otherwise leave it intact.

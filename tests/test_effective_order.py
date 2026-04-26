@@ -43,6 +43,11 @@ def _safe_x0(name):
         "cos": 0.5,
         "sinh": 0.4,
         "cosh": 0.4,
+        "atan2": 0.5,
+        "integer_pow": 0.7,
+        "cumprod": 0.6,
+        "cummax": 0.4,
+        "cummin": 0.4,
     }.get(name, 0.5)
 
 
@@ -80,6 +85,16 @@ def _univariate_fn(name):
         return lambda x: lax.pow(x, jnp.float64(1.7))
     if name == "div":
         return lambda x: 2.0 / (1.0 + x)
+    if name == "atan2":
+        return lambda x: lax.atan2(x, jnp.float64(2.0))
+    if name == "integer_pow":
+        return lambda x: x ** 3
+    if name == "cumprod":
+        return lambda x: lax.cumprod(jnp.stack([x, x * 2.0, x * 3.0]))
+    if name == "cummax":
+        return lambda x: lax.cummax(jnp.stack([x * 1.5, x * 0.5, x * 2.0]))
+    if name == "cummin":
+        return lambda x: lax.cummin(jnp.stack([x * 1.5, x * 0.5, x * 2.0]))
     return None
 
 
