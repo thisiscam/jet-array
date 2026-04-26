@@ -232,6 +232,13 @@ combine with `jax.vmap`.
 
 ### Caveats
 
+- `effective_order` propagates across both explicit (`jax.jit`) and
+  implicit (`jnp.*` operator) jit boundaries. The implementation binds
+  `effective_order` as an extra runtime input to each inner pjit so the
+  inner `JetTrace` reads it as a tracer and threads it into every
+  primitive rule's `_jet_scan` call. No special action needed from the
+  user — write your function in plain `jnp` style and the hint is
+  honored throughout.
 - The primitives a JAX program uses fall into three categories:
   - **Linear / zero-derivative** (`add`, `sub`, multiplication by a
     constant, `neg`, broadcasting, slicing, comparisons, …): the operation
@@ -257,6 +264,10 @@ combine with `jax.vmap`.
     short-circuit, but they don't need to — the per-entry cost is O(1)
     and the contract is satisfied because garbage-in-garbage-out for
     indices above `effective_order` is fine.
+- One-time cost: when `effective_order` is set, each inner pjit re-traces
+  with one extra input (the eff scalar). This adds a small compile-time
+  cost the first time a function is `jet`'d with `effective_order` set vs
+  without — both jaxprs are cached.
 - Because output entries above `effective_order` are unspecified for the
   second category, treat the whole `series_out[effective_order:]` slice as
   garbage even if upstream linear ops would otherwise leave it intact.

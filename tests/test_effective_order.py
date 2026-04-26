@@ -166,3 +166,72 @@ def test_effective_order_full_K_equals_no_hint():
     _, s_no = jet(fn, (x0,), (series_in,))
     _, s_K = jet(fn, (x0,), (series_in,), effective_order=jnp.array(K))
     np.testing.assert_allclose(s_no, s_K, rtol=1e-12, atol=1e-14)
+
+
+# ----------------------------------------------------------------------------
+# Cross-jit propagation: effective_order must survive jit boundaries.
+# Regression coverage for the _pjit_jet_rule fix that threads eff as an
+# extra input to the inner pjit.
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name,fn_factory", [
+    # Each function uses jnp.* (which wraps in implicit jit) AND composes
+    # with jnp.exp so the high-order Taylor coefficients are non-zero —
+    # this lets us verify truncation by comparing the tail.
+    ("jnp.exp",         lambda: lambda x: jnp.exp(x)),
+    ("jnp.sin",         lambda: lambda x: jnp.exp(jnp.sin(x))),
+    ("jnp.tanh",        lambda: lambda x: jnp.exp(jnp.tanh(x))),
+    ("x**0.5",          lambda: lambda x: jnp.exp(x ** 0.5)),
+    ("x*x",             lambda: lambda x: jnp.exp(x * x)),
+    ("x**3",            lambda: lambda x: jnp.exp(x ** 3)),
+    ("compose_two",     lambda: lambda x: jnp.exp(jnp.sin(jnp.tanh(x)))),
+])
+def test_effective_order_propagates_across_implicit_jit(name, fn_factory):
+    """Functions that use jnp.* operators (which wrap each call in jit)
+    still skip work above effective_order. Without the _pjit_jet_rule fix,
+    the inner JetTrace would see effective_order=None and produce a
+    full-K series; with the fix, the eff is threaded as an extra input
+    and the series is truncated."""
+    fn = fn_factory()
+    x0 = jnp.asarray(0.5, dtype=jnp.float64)
+    series_in = jnp.zeros(K, dtype=jnp.float64).at[0].set(1.0)
+
+    _, s_ref = jet(fn, (x0,), (series_in,))
+    _, s_eff = jet(fn, (x0,), (series_in,), effective_order=jnp.array(3))
+
+    # Prefix correctness:
+    np.testing.assert_allclose(
+        s_eff[:3], s_ref[:3], rtol=RTOL, atol=ATOL,
+        err_msg=f"{name}: prefix mismatch",
+    )
+    # Tail must be truncated (zero), not full. Outer jnp.exp ensures the
+    # reference tail is non-zero, so this is a real distinguishing test.
+    assert not jnp.allclose(s_ref[3:], s_eff[3:], rtol=RTOL, atol=ATOL), (
+        f"{name}: effective_order did not actually skip work — tail equals "
+        f"the no-hint output, indicating the hint was lost across a jit "
+        f"boundary. ref={s_ref[3:]}, eff={s_eff[3:]}"
+    )
+    # Truncated entries should be exactly zero (the _jet_scan no-op path
+    # leaves them at the JetTrace's initial zero).
+    np.testing.assert_allclose(s_eff[3:], 0.0, atol=1e-12,
+                               err_msg=f"{name}: truncated tail not zero")
+
+
+def test_effective_order_propagates_across_explicit_jit():
+    """jax.jit-wrapped subroutines also propagate effective_order."""
+    @jax.jit
+    def inner(x):
+        return jnp.exp(jnp.sin(x))
+
+    fn = lambda x: inner(x) + jnp.exp(x)
+    x0 = jnp.asarray(0.5, dtype=jnp.float64)
+    series_in = jnp.zeros(K, dtype=jnp.float64).at[0].set(1.0)
+
+    _, s_ref = jet(fn, (x0,), (series_in,))
+    _, s_eff = jet(fn, (x0,), (series_in,), effective_order=jnp.array(3))
+
+    np.testing.assert_allclose(s_eff[:3], s_ref[:3], rtol=RTOL, atol=ATOL)
+    assert not jnp.allclose(s_ref[3:], s_eff[3:], rtol=RTOL, atol=ATOL), (
+        "effective_order did not propagate through jax.jit"
+    )

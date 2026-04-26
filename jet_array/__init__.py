@@ -261,6 +261,34 @@ def traceable(f, store, in_tree_def, *primals_and_series):
     return out_flat
 
 
+@lu.transformation2
+def jet_fun_with_eff(f, order, primals, series, eff):
+    """Like jet_fun, but pulls effective_order from a runtime input."""
+    tag = core.TraceTag()
+    out_primals, out_terms = f(tag, order, eff, primals, series)
+    out_terms = [
+        jnp.zeros((order,) + p.shape) if s is zero_series else s
+        for p, s in zip(out_primals, out_terms)
+    ]
+    return out_primals, out_terms
+
+
+@lu.transformation_with_aux2
+def traceable_with_eff(f, store, in_tree_def, *all_inputs):
+    """Like traceable, but the LAST input is the effective_order scalar.
+
+    Used by _pjit_jet_rule when threading effective_order across a jit
+    boundary: the inner jaxpr accepts one extra runtime input, and the
+    inner JetTrace reads its effective_order from that input.
+    """
+    *primals_and_series, eff = all_inputs
+    primals_in, series_in = tree_unflatten(in_tree_def, primals_and_series)
+    primals_out, series_out = f(primals_in, series_in, eff)
+    out_flat, out_tree_def = tree_flatten((primals_out, series_out))
+    store.store(out_tree_def)
+    return out_flat
+
+
 class JetTracer(core.Tracer):
     __slots__ = ["primal", "terms"]
 
@@ -580,7 +608,11 @@ def def_comp(prim, comp, **kwargs):
     """
     Define the jet rule for a primitive in terms of a composition of simpler primitives.
     """
-    jet_rules[prim] = partial(jet, comp, **kwargs)
+    def comp_rule(primals_in, series_in, _jet_effective_order=None, **_):
+        return jet(comp, primals_in, series_in,
+                   effective_order=_jet_effective_order, **kwargs)
+    jet_rules[prim] = comp_rule
+    _register_eff_order_rule(prim)
 
 
 
@@ -1250,7 +1282,8 @@ jet_rules[lax.scatter_add_p] = _scatter_add_rule
 
 @weakref_lru_cache
 def _jet_jaxpr(
-    jaxpr: core.ClosedJaxpr, order: int, primals_and_series_avals, in_tree_def
+    jaxpr: core.ClosedJaxpr, order: int, primals_and_series_avals, in_tree_def,
+    propagate_effective_order: bool = False,
 ) -> tuple[core.ClosedJaxpr, Any]:
     # Create a minimal debug_info since JAX 0.8.0+ requires it and validates arg_names count.
     # We can't use the original jaxpr's debug_info because the number of arguments changes
@@ -1262,13 +1295,29 @@ def _jet_jaxpr(
         result_paths=None,
     )
     f = lu.wrap_init(core.jaxpr_as_fun(jaxpr), debug_info=debug_info)
-    # Recursive jet calls don't propagate effective_order (inner jit boundaries)
-    f_jet, out_tree_def = traceable(jet_fun(jet_subtrace(f), order, None), in_tree_def)
+
+    if propagate_effective_order:
+        # primals_and_series_avals's last entry is the effective_order scalar.
+        # Pull it out of the input list and feed it into the inner JetTrace,
+        # so the hint survives the jit boundary.
+        f_jet, out_tree_def = traceable_with_eff(
+            jet_fun_with_eff(jet_subtrace(f), order),
+            in_tree_def,
+        )
+    else:
+        # No propagation: inner JetTrace gets effective_order=None.
+        f_jet, out_tree_def = traceable(
+            jet_fun(jet_subtrace(f), order, None),
+            in_tree_def,
+        )
     jaxpr_jet, _, consts = pe.trace_to_jaxpr_dynamic(f_jet, primals_and_series_avals)
     return core.ClosedJaxpr(jaxpr_jet, consts), out_tree_def
 
 
 def _pjit_jet_rule(primals_in, series_in, **params):
+    eff = params.get("_jet_effective_order", None)
+    propagate = eff is not None
+
     primals_and_series, in_tree_def = tree_flatten((primals_in, series_in))
 
     # FIX: Get order from enclosing jet trace if series_in is empty
@@ -1276,18 +1325,29 @@ def _pjit_jet_rule(primals_in, series_in, **params):
     # to ensure consistent series dimensions throughout the computation.
     if len(series_in) == 0:
         # Use the order passed from the enclosing jet trace
-        order = params.pop("_jet_order", 0)
+        order = params.get("_jet_order", 0)
     else:
         order = series_in[0].shape[0]
 
+    # When propagating, append effective_order as an extra runtime input so
+    # the inner JetTrace can read it. Otherwise the hint dies at this jit
+    # boundary.
+    if propagate:
+        eff_value = jnp.asarray(eff, dtype=jnp.int32)
+        bound_inputs = list(primals_and_series) + [eff_value]
+    else:
+        bound_inputs = list(primals_and_series)
+
     primals_and_series_avals = tuple(
-        core.shaped_abstractify(x) for x in primals_and_series
+        core.shaped_abstractify(x) for x in bound_inputs
     )
     jaxpr_jet, out_tree_def = _jet_jaxpr(
-        params["jaxpr"], order, primals_and_series_avals, in_tree_def
+        params["jaxpr"], order, primals_and_series_avals, in_tree_def,
+        propagate_effective_order=propagate,
     )
     num_series_in = len(primals_in)
     num_series_out = len(params["out_shardings"])
+    num_extra = 1 if propagate else 0
 
     # Remove internal jet keys from params before passing to pjit.bind
     _jet_keys = {"_jet_order", "_jet_effective_order"}
@@ -1297,16 +1357,17 @@ def _pjit_jet_rule(primals_in, series_in, **params):
         **params_for_pjit,
         "jaxpr": jaxpr_jet,
         "in_shardings": (
-            params["in_shardings"] + (sharding_impls.UNSPECIFIED,) * num_series_in
+            params["in_shardings"]
+            + (sharding_impls.UNSPECIFIED,) * (num_series_in + num_extra)
         ),
         "out_shardings": (
             params["out_shardings"] + (sharding_impls.UNSPECIFIED,) * num_series_out
         ),
-        "in_layouts": params["in_layouts"] + (None,) * num_series_in,
+        "in_layouts": params["in_layouts"] + (None,) * (num_series_in + num_extra),
         "out_layouts": params["out_layouts"] + (None,) * num_series_out,
-        "donated_invars": params["donated_invars"] + (False,) * num_series_in,
+        "donated_invars": params["donated_invars"] + (False,) * (num_series_in + num_extra),
     }
-    result = jex.core.primitives.jit_p.bind(*primals_and_series, **new_params)
+    result = jex.core.primitives.jit_p.bind(*bound_inputs, **new_params)
     return tree_unflatten(out_tree_def(), result)
 
 
