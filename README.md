@@ -44,9 +44,8 @@ faster — Taylor-mode pays only when `K ≥ ~3`.
 pip install jet-array
 ```
 
-`jet_array` uses `jax._src` internals and is currently pinned to
-`jax>=0.8,<0.9`. Compatibility across JAX versions will be tightened as the
-package matures.
+`jet_array` uses `jax._src` internals and is currently tested on
+JAX 0.8.x, 0.9.x, and 0.10.x. The pin is `jax>=0.8,<0.11`.
 
 ## API
 

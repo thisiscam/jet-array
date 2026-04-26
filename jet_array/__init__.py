@@ -289,18 +289,31 @@ def traceable_with_eff(f, store, in_tree_def, *all_inputs):
     return out_flat
 
 
+import inspect as _inspect
+
+# JAX changed Tracer.__init__'s signature in 0.10: it now requires (trace, aval).
+# Detect once at module load and adapt JetTracer accordingly.
+_TRACER_TAKES_AVAL = (
+    "aval" in _inspect.signature(core.Tracer.__init__).parameters
+)
+
+
 class JetTracer(core.Tracer):
     __slots__ = ["primal", "terms"]
 
     def __init__(self, trace, primal, terms):
         assert type(terms) in (ZeroSeries,) or isinstance(terms, jnp.ndarray)
-        self._trace = trace
+        if _TRACER_TAKES_AVAL:
+            super().__init__(trace, core.typeof(primal))
+        else:
+            self._trace = trace
         self.primal = primal
         self.terms = terms
 
-    @property
-    def aval(self):
-        return core.get_aval(self.primal)
+    if not _TRACER_TAKES_AVAL:
+        @property
+        def aval(self):
+            return core.get_aval(self.primal)
 
     def full_lower(self):
         if self.terms is zero_series:
