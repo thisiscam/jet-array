@@ -183,18 +183,20 @@ is fixed.
 
 ### When you want this
 
-A motivating workload: nested-Archimedean copula likelihoods with
-per-observation censoring. Each observation needs a Bell-polynomial
-expansion whose effective order equals its number of *uncensored* leaves,
-which varies across the batch. Without `effective_order`, you face two
-bad options:
+The expansion order `K` is part of the input shape, so a function
+`jet`'d at one `K` re-traces and re-compiles for any other `K`. If the
+order you actually need varies across calls — different time steps in
+an integrator, different inputs in a batch, different convergence
+checks in an iterative method — you would otherwise face two bad
+options:
 
-- Pad to the maximum possible order for every observation — wasted work
-  on always-zero coefficients.
-- Re-trace and re-compile per observation — fatal under high cardinality.
+- Pad every call to the maximum possible order. Wastes compute on
+  coefficients you don't use.
+- Re-trace per order. Fatal whenever the order changes more often than
+  the cost of compilation.
 
-`effective_order` lets you compile once at `K = max possible order` and
-pay per-observation work proportional to that observation's actual order.
+`effective_order` resolves both: compile once at `K = max possible
+order` and pay per-call work proportional to that call's actual order.
 
 ### Example
 
@@ -205,30 +207,29 @@ from jet_array import jet
 
 K_MAX = 16                                    # static array size
 
-def slow_chain(x):
-    # A composition that uses several primitives whose rules respect
-    # effective_order — exp/log/logistic are good candidates.
-    y = jnp.exp(x)
-    y = jnp.log1p(y)
-    y = jnp.tanh(y)
-    return y
-
 @jax.jit
 def taylor(x, k_dyn):
+    """Taylor series of exp(sin(x)) at x, computed up to order k_dyn,
+    with a fixed array size of K_MAX so a single XLA program handles
+    every order."""
     series_in = jnp.zeros(K_MAX).at[0].set(1.0)
-    return jet(slow_chain, (x,), (series_in,), effective_order=k_dyn)
+    return jet(lambda x: jnp.exp(jnp.sin(x)), (x,), (series_in,),
+               effective_order=k_dyn)
 
-# Both calls use the same compiled XLA program.
-# The second runs more work — it computes 12 coefficients instead of 4.
-p1, s1 = taylor(jnp.asarray(0.5), jnp.array(4))
-p2, s2 = taylor(jnp.asarray(0.5), jnp.array(12))
-# s1[:4] is the answer you can use; s1[4:] is unspecified.
-# s2[:12] is the answer; s2[12:] is unspecified.
+# Both calls hit the same compiled program; the second does more work.
+p1, s1 = taylor(jnp.asarray(0.5), jnp.array(4))    # uses s1[:4]
+p2, s2 = taylor(jnp.asarray(0.5), jnp.array(12))   # uses s2[:12]
 ```
 
-For workloads where the dynamic order varies per element of a
-`vmap`-batched dimension, pass an array of `effective_order` values and
-combine with `jax.vmap`.
+For batches where each element wants its own order, pass an array of
+`effective_order` values and combine with `jax.vmap`:
+
+```python
+xs = jnp.linspace(0.0, 1.0, 100)
+ks = jnp.array([3, 5, 8, 12] * 25)         # one per batch element
+batched = jax.vmap(taylor)(xs, ks)
+# batched.series[i, :ks[i]] is the answer for element i.
+```
 
 ### Caveats
 
