@@ -279,9 +279,8 @@ The full correctness suite checks every supported primitive against
 ## Limitations
 
 - Pytree primal inputs are not supported (each primal must be a leaf).
-- The package depends on `jax._src` internals and currently targets
-  JAX 0.8.x.
-- `effective_order` is a hint, not a guarantee — see the caveats above.
+- The package depends on `jax._src` internals; currently tested on
+  JAX 0.8.x, 0.9.x, and 0.10.x.
 
 ## Citation
 
