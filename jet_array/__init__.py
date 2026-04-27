@@ -135,7 +135,8 @@ def _prepend_primal(primal, series):
     return jnp.concatenate([jnp.asarray(primal)[jnp.newaxis, ...], series], axis=0)
 
 
-def jet(fun, primals, series, effective_order=None, **_):
+def jet(fun, primals, series, effective_order=None, log_space=False,
+        return_log_series=False, **_):
     r"""Taylor-mode higher-order automatic differentiation.
 
     Args:
@@ -211,6 +212,14 @@ def jet(fun, primals, series, effective_order=None, **_):
     primals = tuple(jnp.asarray(p) for p in primals)
     series = tuple(jnp.asarray(s) for s in series)
 
+    # When log_space=True, every Taylor coefficient is carried as a
+    # (sign, log|c|) pair. The primal is left in raw form (primals don't
+    # underflow in our use cases). Convert series at the boundary; rules
+    # registered in `log_space_rules` operate on LogSeries.
+    if log_space:
+        from .log_space import raw_to_log
+        series = tuple(raw_to_log(s) for s in series)
+
     @lu.transformation_with_aux2
     def flatten_fun_output(f, store, *args):
         ans = f(*args)
@@ -222,17 +231,30 @@ def jet(fun, primals, series, effective_order=None, **_):
         lu.wrap_init(fun, debug_info=api_util.debug_info("jet", fun, primals, {}))
     )
     out_primals, out_terms = jet_fun(
-        jet_subtrace(f), order, effective_order
+        jet_subtrace(f), order, effective_order, log_space
     ).call_wrapped(primals, series)
+    if log_space and not return_log_series:
+        # Convert series back to raw at the boundary. Note: this materialises
+        # any denormal magnitudes as either denormal float64 or true zero,
+        # which can re-introduce the very NaN-gradient pathology log-space
+        # was meant to fix. Pass `return_log_series=True` to keep LogSeries
+        # so downstream code (e.g. acopula's bell pipeline) can stay in
+        # log-domain end-to-end.
+        from .log_space import log_to_raw
+        out_terms = [log_to_raw(t) if hasattr(t, 'log_mag') else t
+                     for t in out_terms]
+    # Note: when log_space=True and return_log_series=True, out_terms is
+    # a list of LogSeries (one per output). The caller is responsible for
+    # consuming them in log-domain.
     return tree_unflatten(out_tree(), out_primals), tree_unflatten(
         out_tree(), out_terms
     )
 
 
 @lu.transformation2
-def jet_fun(f, order, effective_order, primals, series):
+def jet_fun(f, order, effective_order, log_space, primals, series):
     tag = core.TraceTag()
-    out_primals, out_terms = f(tag, order, effective_order, primals, series)
+    out_primals, out_terms = f(tag, order, effective_order, log_space, primals, series)
     out_terms = [
         jnp.zeros((order,) + p.shape) if s is zero_series else s
         for p, s in zip(out_primals, out_terms)
@@ -241,9 +263,10 @@ def jet_fun(f, order, effective_order, primals, series):
 
 
 @lu.transformation2
-def jet_subtrace(f, tag, order, effective_order, primals, series):
+def jet_subtrace(f, tag, order, effective_order, log_space, primals, series):
     with core.take_current_trace() as parent_trace:
-        trace = JetTrace(tag, parent_trace, order, effective_order)
+        trace = JetTrace(tag, parent_trace, order, effective_order,
+                         log_space=log_space)
         in_tracers = map(partial(JetTracer, trace), primals, series)
         with core.set_current_trace(trace):
             ans = f(*in_tracers)
@@ -262,10 +285,10 @@ def traceable(f, store, in_tree_def, *primals_and_series):
 
 
 @lu.transformation2
-def jet_fun_with_eff(f, order, primals, series, eff):
+def jet_fun_with_eff(f, order, log_space, primals, series, eff):
     """Like jet_fun, but pulls effective_order from a runtime input."""
     tag = core.TraceTag()
-    out_primals, out_terms = f(tag, order, eff, primals, series)
+    out_primals, out_terms = f(tag, order, eff, log_space, primals, series)
     out_terms = [
         jnp.zeros((order,) + p.shape) if s is zero_series else s
         for p, s in zip(out_primals, out_terms)
@@ -302,7 +325,9 @@ class JetTracer(core.Tracer):
     __slots__ = ["primal", "terms"]
 
     def __init__(self, trace, primal, terms):
-        assert type(terms) in (ZeroSeries,) or isinstance(terms, jnp.ndarray)
+        from .log_space import LogSeries
+        assert (type(terms) in (ZeroSeries,) or isinstance(terms, jnp.ndarray)
+                or isinstance(terms, LogSeries))
         if _TRACER_TAKES_AVAL:
             super().__init__(trace, core.typeof(primal))
         else:
@@ -323,14 +348,20 @@ class JetTracer(core.Tracer):
 
 
 class JetTrace(core.Trace):
-    __slots__ = ("tag", "parent_trace", "order", "effective_order")
+    __slots__ = ("tag", "parent_trace", "order", "effective_order", "log_space")
 
-    def __init__(self, tag, parent_trace, order, effective_order=None):
+    def __init__(self, tag, parent_trace, order, effective_order=None,
+                 log_space=False):
         super().__init__()
         self.tag = tag
         self.parent_trace = parent_trace
         self.order = order
         self.effective_order = effective_order  # None = compute all orders
+        # When log_space=True, primitive dispatch goes through `log_space_rules`
+        # (each rule operates on LogSeries pairs instead of raw float arrays).
+        # The raw `jet_rules` table is left untouched; users choose at `jet()`
+        # entry. See jet_array/log_space.py for the LogSeries representation.
+        self.log_space = log_space
 
     def to_primal_terms_pair(self, val):
         if isinstance(val, JetTracer) and val._trace.tag is self.tag:
@@ -352,20 +383,48 @@ class JetTrace(core.Trace):
 
         with core.set_current_trace(self.parent_trace):
             # TODO(mattjj): avoid always instantiating zeros
-            series_in = [
-                jnp.zeros((self.order,) + jnp.shape(p), dtype=jnp.result_type(p))
-                if s is zero_series
-                else s
-                for p, s in zip(primals_in, series_in)
-            ]
-            rule = jet_rules[primitive]
+            if self.log_space:
+                from .log_space import LogSeries, LOG_ZERO
+                def _zero_series(p):
+                    shape = (self.order,) + jnp.shape(p)
+                    dtype = jnp.result_type(p)
+                    return LogSeries(
+                        sign=jnp.zeros(shape, dtype=dtype),
+                        log_mag=jnp.full(shape, LOG_ZERO, dtype=dtype),
+                    )
+                series_in = [
+                    _zero_series(p) if s is zero_series else s
+                    for p, s in zip(primals_in, series_in)
+                ]
+            else:
+                series_in = [
+                    jnp.zeros((self.order,) + jnp.shape(p), dtype=jnp.result_type(p))
+                    if s is zero_series
+                    else s
+                    for p, s in zip(primals_in, series_in)
+                ]
+            if self.log_space:
+                # Importing log_space_jet_rules has the side effect of
+                # populating log_space_rules; do it lazily so the raw path
+                # never pays this import.
+                from . import log_space_jet_rules  # noqa: F401
+                from .log_space import log_space_rules
+                if primitive not in log_space_rules:
+                    raise NotImplementedError(
+                        f"primitive {primitive} has no log-space jet rule yet; "
+                        f"add one to jet_array.log_space_jet_rules or set "
+                        f"log_space=False")
+                rule = log_space_rules[primitive]
+            else:
+                rule = jet_rules[primitive]
             # Pass effective_order only to rules that use _jet_scan.
             # Do NOT add it to params dict — rules like linear_prop forward
             # **params to prim.bind(), and JAX primitives reject unknown kwargs.
             eff = self.effective_order
             if primitive.name in ("pjit", "jit"):
                 params_aug = {**params, "_jet_order": self.order,
-                              "_jet_effective_order": eff}
+                              "_jet_effective_order": eff,
+                              "_jet_log_space": self.log_space}
                 primal_out, terms_out = rule(primals_in, series_in, **params_aug)
             elif primitive in _rules_with_effective_order:
                 primal_out, terms_out = rule(primals_in, series_in,
@@ -1297,6 +1356,7 @@ jet_rules[lax.scatter_add_p] = _scatter_add_rule
 def _jet_jaxpr(
     jaxpr: core.ClosedJaxpr, order: int, primals_and_series_avals, in_tree_def,
     propagate_effective_order: bool = False,
+    log_space: bool = False,
 ) -> tuple[core.ClosedJaxpr, Any]:
     # Create a minimal debug_info since JAX 0.8.0+ requires it and validates arg_names count.
     # We can't use the original jaxpr's debug_info because the number of arguments changes
@@ -1314,13 +1374,13 @@ def _jet_jaxpr(
         # Pull it out of the input list and feed it into the inner JetTrace,
         # so the hint survives the jit boundary.
         f_jet, out_tree_def = traceable_with_eff(
-            jet_fun_with_eff(jet_subtrace(f), order),
+            jet_fun_with_eff(jet_subtrace(f), order, log_space),
             in_tree_def,
         )
     else:
         # No propagation: inner JetTrace gets effective_order=None.
         f_jet, out_tree_def = traceable(
-            jet_fun(jet_subtrace(f), order, None),
+            jet_fun(jet_subtrace(f), order, None, log_space),
             in_tree_def,
         )
     jaxpr_jet, _, consts = pe.trace_to_jaxpr_dynamic(f_jet, primals_and_series_avals)
@@ -1330,6 +1390,7 @@ def _jet_jaxpr(
 def _pjit_jet_rule(primals_in, series_in, **params):
     eff = params.get("_jet_effective_order", None)
     propagate = eff is not None
+    log_space = params.get("_jet_log_space", False)
 
     primals_and_series, in_tree_def = tree_flatten((primals_in, series_in))
 
@@ -1340,7 +1401,13 @@ def _pjit_jet_rule(primals_in, series_in, **params):
         # Use the order passed from the enclosing jet trace
         order = params.get("_jet_order", 0)
     else:
-        order = series_in[0].shape[0]
+        s0 = series_in[0]
+        # In log_space mode, series entries are LogSeries (NamedTuple) not
+        # raw arrays — read the order off one of the constituent fields.
+        if hasattr(s0, "sign") and hasattr(s0, "log_mag"):
+            order = s0.sign.shape[0]
+        else:
+            order = s0.shape[0]
 
     # When propagating, append effective_order as an extra runtime input so
     # the inner JetTrace can read it. Otherwise the hint dies at this jit
@@ -1357,13 +1424,14 @@ def _pjit_jet_rule(primals_in, series_in, **params):
     jaxpr_jet, out_tree_def = _jet_jaxpr(
         params["jaxpr"], order, primals_and_series_avals, in_tree_def,
         propagate_effective_order=propagate,
+        log_space=log_space,
     )
     num_series_in = len(primals_in)
     num_series_out = len(params["out_shardings"])
     num_extra = 1 if propagate else 0
 
     # Remove internal jet keys from params before passing to pjit.bind
-    _jet_keys = {"_jet_order", "_jet_effective_order"}
+    _jet_keys = {"_jet_order", "_jet_effective_order", "_jet_log_space"}
     params_for_pjit = {k: v for k, v in params.items() if k not in _jet_keys}
 
     new_params = {
@@ -1385,3 +1453,10 @@ def _pjit_jet_rule(primals_in, series_in, **params):
 
 
 jet_rules[jex.core.primitives.jit_p] = _pjit_jet_rule
+# The same rule body handles both raw and log-space modes — it reads
+# `_jet_log_space` from params and forwards to the inner _jet_jaxpr,
+# which constructs the inner JetTrace in the right mode.
+def _register_pjit_log_rule():
+    from .log_space import log_space_rules
+    log_space_rules[jex.core.primitives.jit_p] = _pjit_jet_rule
+_register_pjit_log_rule()
