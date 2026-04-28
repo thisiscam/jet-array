@@ -1426,9 +1426,23 @@ def _pjit_jet_rule(primals_in, series_in, **params):
         propagate_effective_order=propagate,
         log_space=log_space,
     )
-    num_series_in = len(primals_in)
-    num_series_out = len(params["out_shardings"])
     num_extra = 1 if propagate else 0
+    # In log_space mode each LogSeries series flattens to 2 leaves
+    # (sign, log_mag), so counting `len(primals_in)` undercounts the
+    # actual number of new flat inputs we need to extend the shardings
+    # by. Derive from the total flattened bound_inputs count instead.
+    num_orig_primal_inputs = len(params["in_shardings"])
+    num_series_in_flat = (len(bound_inputs) - num_extra) - num_orig_primal_inputs
+    # Same logic for outputs: count of *new* output leaves beyond the
+    # original jaxpr's outputs.
+    num_orig_outputs = len(params["out_shardings"])
+    # The traced jet jaxpr returns (primals_out, series_out). In raw
+    # mode each series is one array; in log mode each series is a
+    # LogSeries (2 leaves). The flattened output count is determined
+    # by `out_tree_def`; we derive it from the output structure of
+    # the new jaxpr.
+    num_series_out_flat = sum(
+        2 if log_space else 1 for _ in range(num_orig_outputs))
 
     # Remove internal jet keys from params before passing to pjit.bind
     _jet_keys = {"_jet_order", "_jet_effective_order", "_jet_log_space"}
@@ -1439,14 +1453,15 @@ def _pjit_jet_rule(primals_in, series_in, **params):
         "jaxpr": jaxpr_jet,
         "in_shardings": (
             params["in_shardings"]
-            + (sharding_impls.UNSPECIFIED,) * (num_series_in + num_extra)
+            + (sharding_impls.UNSPECIFIED,) * (num_series_in_flat + num_extra)
         ),
         "out_shardings": (
-            params["out_shardings"] + (sharding_impls.UNSPECIFIED,) * num_series_out
+            params["out_shardings"]
+            + (sharding_impls.UNSPECIFIED,) * num_series_out_flat
         ),
-        "in_layouts": params["in_layouts"] + (None,) * (num_series_in + num_extra),
-        "out_layouts": params["out_layouts"] + (None,) * num_series_out,
-        "donated_invars": params["donated_invars"] + (False,) * (num_series_in + num_extra),
+        "in_layouts": params["in_layouts"] + (None,) * (num_series_in_flat + num_extra),
+        "out_layouts": params["out_layouts"] + (None,) * num_series_out_flat,
+        "donated_invars": params["donated_invars"] + (False,) * (num_series_in_flat + num_extra),
     }
     result = jex.core.primitives.jit_p.bind(*bound_inputs, **new_params)
     return tree_unflatten(out_tree_def(), result)
