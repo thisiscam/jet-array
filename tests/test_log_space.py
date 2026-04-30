@@ -50,10 +50,16 @@ def test_round_trip_zero_preserved():
 
 
 def test_round_trip_denormal():
-    """Denormals down to 1e-310 round-trip without loss when
-    flush_denormals=False (the option needed for end-to-end log_space
-    pipelines that keep their consumer in log-domain too)."""
-    vals = jnp.array([1e-300, -1e-200, 5e-310, -1e-50])
+    """Tiny but normal float64 values (above finfo.tiny ≈ 2.2e-308)
+    round-trip without loss when flush_denormals=False.
+
+    True denormals (below finfo.tiny) cannot round-trip on XLA CPU because
+    the backend has IEEE flush-to-zero enabled — jnp.log of a denormal
+    underflows to -inf inside raw_to_log. Test the boundary just above
+    that range, where flush_denormals=False is meaningfully different
+    from the default (the default would still flush log_mag values below
+    log(tiny) ≈ -708.4)."""
+    vals = jnp.array([1e-300, -1e-200, 1e-307, -1e-50])
     back = log_to_raw(raw_to_log(vals), flush_denormals=False)
     rel_err = jnp.max(jnp.abs(back - vals) / jnp.abs(vals))
     assert float(rel_err) < 1e-13

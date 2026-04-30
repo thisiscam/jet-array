@@ -937,7 +937,10 @@ def _logistic_taylor(primals_in, series_in, _jet_effective_order=None, **_):
 
     u = _prepend_primal(x, series)  # shape (K+1, ...)
     j_idx = jnp.arange(order + 1, dtype=dtype)  # 0…K
-    u_scaled = j_idx * u  # j·u_j
+    # Reshape for explicit broadcast over leading series axis when x has
+    # rank >= 1; bare `j_idx * u` fails rank-promotion under jit.
+    j_bcast = j_idx.reshape((order + 1,) + (1,) * x.ndim)
+    u_scaled = j_bcast * u  # j·u_j
 
     pad = (order - 1, 0)  # left padding
     u_pad = jnp.pad(u_scaled, (pad,) + ((0, 0),) * (x.ndim), mode="constant")[::-1]
@@ -1475,3 +1478,165 @@ def _register_pjit_log_rule():
     from .log_space import log_space_rules
     log_space_rules[jex.core.primitives.jit_p] = _pjit_jet_rule
 _register_pjit_log_rule()
+
+
+def _scan_jet_rule(primals_in, series_in, *, jaxpr, num_consts, num_carry, length,
+                   reverse, unroll, linear=None, _split_transpose=None, **params):
+    """Jet rule for ``lax.scan_p``.
+
+    Threads Taylor-series tangents through scan iterations.  The original
+    scan body has signature
+
+        body(*consts, *carry, *x_per_iter) -> (*new_carry, *y_per_iter)
+
+    Under jet, every input/output gains a Taylor-series companion of shape
+    ``(order, *primal_shape)``.  We build a *new* body whose flat input
+    layout is
+
+        [consts_p..., consts_s..., carry_p..., carry_s..., x_p..., x_s...]
+
+    so that ``lax.scan_p`` can treat consts_p+consts_s as consts, carry_p+
+    carry_s as the threaded carry, and x_p+x_s as scan inputs.  The body
+    is then traced under JetTrace to give it Taylor-aware semantics.
+
+    Subtlety on xs series shape: outside the scan, an x with primal shape
+    ``(T, *Sx)`` carries series of shape ``(order, T, *Sx)`` because the
+    JetTrace prepends ``order`` as the leading axis.  Inside the scan body
+    (per iteration) the body sees ``x_p`` of shape ``(*Sx)`` and expects
+    ``x_s`` of shape ``(order, *Sx)`` — so we must transpose xs series to
+    ``(T, order, *Sx)`` before binding ``scan_p``, then transpose ys series
+    back from ``(T, order, *Sy)`` to ``(order, T, *Sy)`` after.
+    """
+    if not series_in:
+        primals_out = lax.scan_p.bind(
+            *primals_in, jaxpr=jaxpr, num_consts=num_consts,
+            num_carry=num_carry, length=length, reverse=reverse,
+            unroll=unroll, linear=linear,
+            _split_transpose=_split_transpose,
+        )
+        return primals_out, [zero_series] * len(primals_out)
+
+    s0 = series_in[0]
+    if hasattr(s0, "sign") and hasattr(s0, "log_mag"):
+        raise NotImplementedError(
+            "scan jet rule does not yet support log_space mode "
+            "(LogSeries through scan body); use raw mode for now"
+        )
+    order = s0.shape[0]
+    log_space = False
+
+    consts_p = list(primals_in[:num_consts])
+    init_p = list(primals_in[num_consts:num_consts + num_carry])
+    xs_p = list(primals_in[num_consts + num_carry:])
+    consts_s = list(series_in[:num_consts])
+    init_s = list(series_in[num_consts:num_consts + num_carry])
+    xs_s = list(series_in[num_consts + num_carry:])
+
+    nc, ni, nx = num_consts, num_carry, len(xs_p)
+    ny = len(jaxpr.out_avals) - num_carry
+
+    body_in_avals = list(jaxpr.in_avals)
+    consts_avals_p = body_in_avals[:nc]
+    carry_avals_p = body_in_avals[nc:nc + ni]
+    x_avals_p = body_in_avals[nc + ni:]
+    consts_avals_s = [
+        core.ShapedArray((order,) + a.shape, a.dtype) for a in consts_avals_p
+    ]
+    carry_avals_s = [
+        core.ShapedArray((order,) + a.shape, a.dtype) for a in carry_avals_p
+    ]
+    x_avals_s = [
+        core.ShapedArray((order,) + a.shape, a.dtype) for a in x_avals_p
+    ]
+    new_in_avals = (
+        consts_avals_p + consts_avals_s
+        + carry_avals_p + carry_avals_s
+        + x_avals_p + x_avals_s
+    )
+
+    body_fn = core.jaxpr_as_fun(jaxpr)
+
+    def new_body_fn(*flat_inputs):
+        c_p = flat_inputs[:nc]
+        c_s = flat_inputs[nc:2 * nc]
+        cy_p = flat_inputs[2 * nc:2 * nc + ni]
+        cy_s = flat_inputs[2 * nc + ni:2 * nc + 2 * ni]
+        x_p = flat_inputs[2 * nc + 2 * ni:2 * nc + 2 * ni + nx]
+        x_s = flat_inputs[2 * nc + 2 * ni + nx:]
+
+        primals_body = list(c_p) + list(cy_p) + list(x_p)
+        series_body = list(c_s) + list(cy_s) + list(x_s)
+
+        body_wrapped = lu.wrap_init(
+            body_fn,
+            debug_info=lu.DebugInfo(
+                traced_for="scan_jet_inner",
+                func_src_info="scan body",
+                arg_names=None, result_paths=None,
+            ),
+        )
+        f_jet = jet_fun(jet_subtrace(body_wrapped), order, None, log_space)
+        out_p, out_s = f_jet.call_wrapped(primals_body, series_body)
+
+        new_carry_p = list(out_p[:ni])
+        new_carry_s = list(out_s[:ni])
+        y_p = list(out_p[ni:])
+        y_s = list(out_s[ni:])
+        return tuple(new_carry_p) + tuple(new_carry_s) + tuple(y_p) + tuple(y_s)
+
+    new_body_wrapped = lu.wrap_init(
+        new_body_fn,
+        debug_info=lu.DebugInfo(
+            traced_for="scan_jet_outer",
+            func_src_info="jet scan wrapper",
+            arg_names=None, result_paths=None,
+        ),
+    )
+    new_jaxpr_inner, _, new_consts = pe.trace_to_jaxpr_dynamic(
+        new_body_wrapped, tuple(new_in_avals)
+    )
+    new_jaxpr = core.ClosedJaxpr(new_jaxpr_inner, new_consts)
+
+    xs_s_for_scan = [jnp.swapaxes(s, 0, 1) for s in xs_s]
+    new_inputs = (
+        consts_p + consts_s
+        + init_p + init_s
+        + xs_p + xs_s_for_scan
+    )
+
+    bind_kwargs = dict(
+        jaxpr=new_jaxpr,
+        num_consts=2 * nc,
+        num_carry=2 * ni,
+        length=length,
+        reverse=reverse,
+        unroll=unroll,
+    )
+    # `linear` and `_split_transpose` exist in older JAX (≤0.9) scan_p but
+    # were removed in newer versions. Pass through only when present.
+    if linear is not None:
+        consts_linear = list(linear[:nc])
+        init_linear = list(linear[nc:nc + ni])
+        xs_linear = list(linear[nc + ni:])
+        bind_kwargs["linear"] = tuple(
+            consts_linear + [False] * nc
+            + init_linear + [False] * ni
+            + xs_linear + [False] * nx
+        )
+    if _split_transpose is not None:
+        bind_kwargs["_split_transpose"] = _split_transpose
+
+    out_flat = lax.scan_p.bind(*new_inputs, **bind_kwargs)
+
+    new_carry_p = list(out_flat[:ni])
+    new_carry_s = list(out_flat[ni:2 * ni])
+    ys_p = list(out_flat[2 * ni:2 * ni + ny])
+    ys_s = list(out_flat[2 * ni + ny:])
+    ys_s = [jnp.swapaxes(s, 0, 1) for s in ys_s]
+
+    primals_out = new_carry_p + ys_p
+    series_out = new_carry_s + ys_s
+    return primals_out, series_out
+
+
+jet_rules[lax.scan_p] = _scan_jet_rule
