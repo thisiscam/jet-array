@@ -140,6 +140,34 @@ def test_log_add_with_zero():
     np.testing.assert_allclose(log_to_raw(res), a + b, rtol=1e-13)
 
 
+def test_log_add_both_zero_grad_finite():
+    """Both operands structural zero: forward is the zero, gradient stays finite.
+
+    Without the big_log_safe shift in log_add, ``small_log - big_log`` evaluates
+    to ``(-inf) - (-inf) = NaN`` along the dangerous (same_sign / opp_sign)
+    branches; the forward is masked correctly via ``where``, but reverse-mode
+    autodiff still differentiates through the NaN computation and propagates a
+    NaN gradient.  This regression locks in the shifted-reference behaviour.
+    """
+    from jet_array.log_space import LogSeries
+
+    zero_a = raw_to_log(jnp.array(0.0))
+    zero_b = raw_to_log(jnp.array(0.0))
+
+    res = log_add(zero_a, zero_b)
+    assert float(res.sign) == 0.0
+    assert bool(jnp.isneginf(res.log_mag))
+
+    # Differentiate the result's log_mag w.r.t. a sign-zero LogSeries whose
+    # log_mag is exactly -inf.  Pre-fix this returned NaN.
+    def loss(la):
+        a_perturbed = LogSeries(sign=zero_a.sign, log_mag=la)
+        return log_add(a_perturbed, zero_b).log_mag
+
+    g = jax.grad(loss)(zero_a.log_mag)
+    assert not bool(jnp.isnan(g)), f"gradient is NaN: {g}"
+
+
 def test_log_sum_signed_logsumexp():
     v = jnp.array([1.0, -2.0, 3.0, -4.0, 5.0])
     res = log_sum(raw_to_log(v), axis=0)

@@ -110,14 +110,23 @@ def log_add(a: LogSeries, b: LogSeries) -> LogSeries:
     small_log = jnp.where(a_bigger, b.log_mag, a.log_mag)
     big_sign = jnp.where(a_bigger, a.sign, b.sign)
 
-    # `delta = small_log - big_log <= 0`. Note: -inf - finite = -inf gives
-    # exp(-inf) = 0, so the small=zero case naturally yields log|sum| = big.
-    delta = small_log - big_log
+    # Shift big_log to a finite reference when both operands are structural
+    # zero (big_log = -inf), so that `small_log - big_log_safe = -inf - 0 =
+    # -inf` keeps the dangerous branches finite. The both-zero case is
+    # masked out below to LOG_ZERO regardless, so this shift is irrelevant
+    # to the forward value but keeps the reverse-mode gradient finite.
+    big_log_safe = jnp.where(jnp.isneginf(big_log),
+                             jnp.zeros_like(big_log), big_log)
+
+    # `delta = small_log - big_log_safe <= 0`. With the shift, both-zero
+    # gives delta = -inf instead of NaN; finite-vs-zero unchanged because
+    # big_log was already finite.
+    delta = small_log - big_log_safe
 
     # log1p(exp(delta))   for same sign  (always finite, >= log 1 = 0)
     # log1p(-exp(delta))  for opposite sign (could be -inf at exact cancellation)
-    same_sign_log = big_log + jnp.log1p(jnp.exp(delta))
-    opp_sign_log = big_log + jnp.log1p(-jnp.exp(delta))
+    same_sign_log = big_log_safe + jnp.log1p(jnp.exp(delta))
+    opp_sign_log = big_log_safe + jnp.log1p(-jnp.exp(delta))
 
     # Default: one of the operands is zero, so result is the other.
     # (We compute `big_log` and `big_sign` which already reflect "the
