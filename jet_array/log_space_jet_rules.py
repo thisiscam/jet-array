@@ -13,18 +13,34 @@ replaced with its log-space sibling from :mod:`jet_array.log_space_ops`.
 This keeps diffs reviewable and makes it obvious that the math hasn't
 changed, only the representation.
 
-Coverage (log-jet branch, work in progress)
--------------------------------------------
+Coverage
+--------
 Implemented:
-  * div_p, mul_p, add_p, sub_p, neg_p
-  * exp_p, expm1_p, log_p, log1p_p
-  * integer_pow_p
-  * structural: dynamic_slice_p, convert_element_type_p, broadcast_in_dim_p
+  * Arithmetic: add_p, sub_p, neg_p, mul_p, div_p
+  * Elementwise unary: exp_p, expm1_p, log_p, log1p_p, abs_p,
+    logistic_p, tanh_p, sin_p, cos_p, sinh_p, cosh_p, erf_p, erf_inv_p
+  * Power: integer_pow_p, pow_p
+  * Bilinear: dot_general_p, conv_general_dilated_p
+  * Reductions: reduce_sum_p, reduce_window_sum_p, cumsum_p,
+    reduce_max_p, reduce_min_p, max_p, min_p
+  * Predicate / logical (zero-prop): le_p, lt_p, gt_p, ge_p, eq_p,
+    ne_p, not_p, and_p, or_p, xor_p, floor_p, ceil_p, round_p, sign_p,
+    is_finite_p, shift_left_p, shift_right_arithmetic_p,
+    shift_right_logical_p, bitcast_convert_type_p, stop_gradient_p
+  * select_n_p
+  * Pure data movement: convert_element_type_p, broadcast_in_dim_p,
+    reshape_p, squeeze_p, transpose_p, slice_p, concatenate_p, pad_p,
+    rev_p, dynamic_slice_p, dynamic_update_slice_p, gather_p,
+    copy_p, device_put_p
+  * jit/pjit (registered in jet_array/__init__.py via the same body)
 
-Not yet ported (will fall back to raw or error if encountered):
-  * Trig: sin/cos/tan/asin/acos/atan/atan2
-  * Special: erf/erf_inv/lgamma/digamma
-  * Pow with non-integer exponent
+Not yet ported (will raise NotImplementedError if encountered):
+  * scan_p, scatter_add_p
+  * tan_p, asin_p, acos_p, atan_p, atan2_p
+  * lgamma_p, digamma_p
+  * fft_p — output is complex; needs LogSeries.sign generalised to a
+    complex unit phase. Same upgrade unblocks real_p / imag_p /
+    conj_p / complex_p.
 """
 from __future__ import annotations
 
@@ -37,6 +53,36 @@ from .log_space_ops import (
     log_mul, log_div, log_add, log_sub, log_neg, log_sum,
     _is_zero, _zero_like,
 )
+
+
+def _bcast_log_pair(a: LogSeries, b: LogSeries) -> tuple[LogSeries, LogSeries]:
+    """Broadcast two LogSeries to a common shape, treating axis 0 as
+    the (shared) series axis.
+
+    The trailing primal dims align via NumPy-style broadcast. Operands
+    of *different ranks* (e.g. a scalar primal carried as shape ``(n,)``
+    multiplied with an array primal carried as shape ``(n, 4)``) must
+    first append singleton trailing axes to match the higher rank,
+    *not* prepend — prepend would conflict with the leading n axis.
+    JAX's default broadcasting prepends ones, so we reshape explicitly
+    here.
+    """
+    n = a.sign.shape[0]
+    a_trail = a.sign.shape[1:]
+    b_trail = b.sign.shape[1:]
+    if a_trail == b_trail:
+        return a, b
+    target_trail = tuple(jnp.broadcast_shapes(a_trail, b_trail))
+    lt = len(target_trail)
+
+    def fix(field, trail):
+        new_shape = (n,) + (1,) * (lt - len(trail)) + trail
+        return jnp.broadcast_to(field.reshape(new_shape), (n,) + target_trail)
+
+    return (
+        LogSeries(sign=fix(a.sign, a_trail), log_mag=fix(a.log_mag, a_trail)),
+        LogSeries(sign=fix(b.sign, b_trail), log_mag=fix(b.log_mag, b_trail)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +147,7 @@ def _div_taylor_rule_log(u: LogSeries, w: LogSeries) -> LogSeries:
     ``log_add`` / ``log_sum``, which is bounded for any ``delta`` and so
     never overflows or underflows to NaN.
     """
+    u, w = _bcast_log_pair(u, w)
     n = u.sign.shape[0]
     if n == 1:
         # Nothing to scan over — just divide the primals.
@@ -147,10 +194,12 @@ def _linear_log_rule_neg(u: LogSeries) -> LogSeries:
 
 def _linear_log_rule_add(u: LogSeries, v: LogSeries) -> LogSeries:
     """Element-wise add (over the series axis 0 *and* spatial dims)."""
+    u, v = _bcast_log_pair(u, v)
     return log_add(u, v)
 
 
 def _linear_log_rule_sub(u: LogSeries, v: LogSeries) -> LogSeries:
+    u, v = _bcast_log_pair(u, v)
     return log_sub(u, v)
 
 
@@ -165,6 +214,7 @@ def _mul_taylor_rule_log(a: LogSeries, b: LogSeries) -> LogSeries:
 
     Computed via signed logsumexp over the convolution along axis 0.
     """
+    a, b = _bcast_log_pair(a, b)
     n = a.sign.shape[0]
 
     # For each k, c[k] = sum_{i=0..k} a[i] * b[k-i].
@@ -219,6 +269,41 @@ def _integer_pow_taylor_log(u: LogSeries, *, y: int) -> LogSeries:
     if y % 2 == 0:
         return sq
     return _mul_taylor_rule_log(sq, u)
+
+
+# ---------------------------------------------------------------------------
+# pow_p — non-integer exponent. Mirrors the raw `_pow_taylor`:
+# u**r = exp(r * log(u)).  Build the t = r*log(u) series in log-space, then
+# use the same exp-recurrence as `_exp_taylor_rule_log` but with the primal
+# initialised to u_primal**r_primal (computed once in raw form, cheap and
+# well-conditioned because u is positive in the domains we care about).
+# ---------------------------------------------------------------------------
+
+def _pow_taylor_rule_log(u: LogSeries, r: LogSeries) -> LogSeries:
+    """Taylor rule for ``v = u ** r`` (real-valued exponent) in log-space.
+
+    Both ``u`` and ``r`` arrive as full ``(n, ...)`` LogSeries (primal at
+    index 0). The series ``t = r * log(u)`` is assembled by chaining the
+    log-space ``log`` and ``mul`` rules; the result is then fed to the
+    exp-propagation routine, with the primal slot patched to
+    ``u[0] ** r[0]`` so we don't pay a redundant log/exp on the value.
+    """
+    log_u = _log_taylor_rule_log(u)              # log(u) coefficients
+    t = _mul_taylor_rule_log(r, log_u)           # r * log(u)
+
+    # Compute u_primal**r_primal in raw form. We mask structural zeros to a
+    # plain 0.0 before pow so we don't get NaN from `0.0 * exp(-inf)`.
+    def _to_raw_primal(ls0):
+        is_zero = (ls0.sign == 0) | jnp.isneginf(ls0.log_mag)
+        raw = ls0.sign * jnp.exp(ls0.log_mag)
+        return jnp.where(is_zero, jnp.zeros_like(raw), raw)
+
+    u0_raw = _to_raw_primal(_ls_index(u, 0))
+    r0_raw = _to_raw_primal(_ls_index(r, 0))
+    v0_raw = jnp.power(u0_raw, r0_raw)
+    v0_log = raw_to_log(v0_raw)
+
+    return _exp_propagate_log(t, v0_log)
 
 
 # ---------------------------------------------------------------------------
@@ -454,22 +539,6 @@ def _log_recurrence_log(u: LogSeries, log_kind: str) -> LogSeries:
 
 
 # ---------------------------------------------------------------------------
-# Structural rules (just propagate log-form pair through unchanged)
-# ---------------------------------------------------------------------------
-
-def _structural_dynamic_slice_log(u: LogSeries, *start_indices, **params) -> LogSeries:
-    sign = lax.dynamic_slice_p.bind(u.sign, *start_indices, **params)
-    log_mag = lax.dynamic_slice_p.bind(u.log_mag, *start_indices, **params)
-    return LogSeries(sign=sign, log_mag=log_mag)
-
-
-def _structural_broadcast_in_dim_log(u: LogSeries, **params) -> LogSeries:
-    sign = lax.broadcast_in_dim_p.bind(u.sign, **params)
-    log_mag = lax.broadcast_in_dim_p.bind(u.log_mag, **params)
-    return LogSeries(sign=sign, log_mag=log_mag)
-
-
-# ---------------------------------------------------------------------------
 # Wrapper layer: adapt our LogSeries-only rules to the jet-rule signature.
 #
 # In log_space mode, JetTracer holds:
@@ -551,25 +620,576 @@ def _wrap_integer_pow(primals_in, series_in, *, y, **params):
 
 
 log_space_rules[lax.integer_pow_p] = _wrap_integer_pow
+log_space_rules[lax.pow_p] = _wrap_binary(_pow_taylor_rule_log)
 
 
-# Structural primitives: convert_element_type / broadcast_in_dim /
-# dynamic_slice — apply the same op to both sign and log_mag.
-def _wrap_structural_unary(prim):
+# ---------------------------------------------------------------------------
+# Pure data-movement primitives.
+#
+# For ops that just rearrange or select values (slice, broadcast,
+# reshape, dynamic_slice, gather, ...) the (sign, log_mag) representation
+# distributes through naturally: applying the same op to each field
+# independently gives the right answer. We vmap over the series axis
+# (axis 0) so that each Taylor coefficient gets the prim applied to it
+# under the *primal-shape* params, not the (n, ...) series shape.
+# This matches what the raw `linear_prop` does in jet_array/__init__.py.
+# ---------------------------------------------------------------------------
+
+def _structural_log_rule(prim):
+    """Single-operand pure-data-movement rule.
+
+    Used for prims whose only series-carrying input is the leading
+    operand; any remaining args are static or integer indices that
+    pass through unchanged.
+    """
     def wrapped(primals_in, series_in, **params):
-        (p,) = primals_in
-        (s,) = series_in
-        primal_out = prim.bind(p, **params)
-        sign_out = prim.bind(s.sign, **params)
-        log_out = prim.bind(s.log_mag, **params)
+        operand_primal, *rest_primals = primals_in
+        operand_series = series_in[0]
+        primal_out = prim.bind(operand_primal, *rest_primals, **params)
+
+        def per_slice(field):
+            return jax.vmap(
+                lambda x: prim.bind(x, *rest_primals, **params))(field)
+
+        return primal_out, LogSeries(
+            sign=per_slice(operand_series.sign),
+            log_mag=per_slice(operand_series.log_mag),
+        )
+    return wrapped
+
+
+log_space_rules[lax.convert_element_type_p] = _structural_log_rule(
+    lax.convert_element_type_p)
+log_space_rules[lax.broadcast_in_dim_p] = _structural_log_rule(
+    lax.broadcast_in_dim_p)
+log_space_rules[lax.reshape_p] = _structural_log_rule(lax.reshape_p)
+log_space_rules[lax.squeeze_p] = _structural_log_rule(lax.squeeze_p)
+log_space_rules[lax.transpose_p] = _structural_log_rule(lax.transpose_p)
+log_space_rules[lax.slice_p] = _structural_log_rule(lax.slice_p)
+log_space_rules[lax.rev_p] = _structural_log_rule(lax.rev_p)
+log_space_rules[lax.copy_p] = _structural_log_rule(lax.copy_p)
+# NOTE: fft_p is intentionally NOT registered. fft is a linear op over
+# *complex* values (output is complex even from real input), and the
+# current LogSeries representation stores `sign ∈ {-1, 0, +1} ⊂ ℝ`.
+# A correct rule needs sign generalised to a complex unit phase, which
+# also unblocks real_p / imag_p / conj_p / complex_p; until that lands,
+# any code path that hits fft under log_space=True will get a
+# NotImplementedError with a clear pointer.
+
+
+def _dynamic_slice_log_rule(primals_in, series_in, **params):
+    """``dynamic_slice(operand, *start_indices, slice_sizes=...)``.
+
+    start_indices are integer scalars (no series); we keep them static
+    while vmapping the operand's LogSeries fields over axis 0.
+    """
+    operand, *start_indices = primals_in
+    operand_s = series_in[0]
+    primal_out = lax.dynamic_slice_p.bind(operand, *start_indices, **params)
+    sign_out = jax.vmap(
+        lambda s: lax.dynamic_slice_p.bind(s, *start_indices, **params)
+    )(operand_s.sign)
+    log_out = jax.vmap(
+        lambda s: lax.dynamic_slice_p.bind(s, *start_indices, **params)
+    )(operand_s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.dynamic_slice_p] = _dynamic_slice_log_rule
+
+
+def _dynamic_update_slice_log_rule(primals_in, series_in, **params):
+    """``dynamic_update_slice(operand, update, *start_indices)``."""
+    operand, update, *start_indices = primals_in
+    operand_s, update_s = series_in[0], series_in[1]
+    primal_out = lax.dynamic_update_slice_p.bind(
+        operand, update, *start_indices, **params)
+
+    def vupdate(op_s, up_s):
+        return jax.vmap(
+            lambda o, u: lax.dynamic_update_slice_p.bind(
+                o, u, *start_indices, **params),
+            in_axes=(0, 0),
+        )(op_s, up_s)
+
+    return primal_out, LogSeries(
+        sign=vupdate(operand_s.sign, update_s.sign),
+        log_mag=vupdate(operand_s.log_mag, update_s.log_mag),
+    )
+
+
+log_space_rules[lax.dynamic_update_slice_p] = _dynamic_update_slice_log_rule
+
+
+def _concatenate_log_rule(primals_in, series_in, *, dimension, **_):
+    """``concatenate([a, b, ...], axis=dimension)``. All operands carry
+    series; concatenate each field-wise along the *primal* axis (which
+    becomes axis ``dimension+1`` in the (n, ...) series view)."""
+    primal_out = lax.concatenate(list(primals_in), dimension=dimension)
+    sign_arrays = [s.sign for s in series_in]
+    log_arrays = [s.log_mag for s in series_in]
+    sign_out = lax.concatenate(sign_arrays, dimension=dimension + 1)
+    log_out = lax.concatenate(log_arrays, dimension=dimension + 1)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.concatenate_p] = _concatenate_log_rule
+
+
+def _split_log_rule(primals_in, series_in, **params):
+    """``split`` produces multiple outputs from one operand; just apply
+    the prim to the primal and to each LogSeries field."""
+    (operand,) = primals_in
+    operand_s = series_in[0]
+    primals_out = lax.split_p.bind(operand, **params)
+    signs_out = jax.vmap(lambda s: lax.split_p.bind(s, **params))(operand_s.sign)
+    logs_out = jax.vmap(lambda s: lax.split_p.bind(s, **params))(operand_s.log_mag)
+    # split returns a tuple; align outputs.
+    series_out = tuple(
+        LogSeries(sign=signs_out[i], log_mag=logs_out[i])
+        for i in range(len(primals_out))
+    )
+    return tuple(primals_out), series_out
+
+
+log_space_rules[lax.split_p] = _split_log_rule
+
+
+def _pad_log_rule(primals_in, series_in, **params):
+    """``pad(operand, padding_value, padding_config)``.
+
+    The padding region in log-space must be structural zero —
+    sign=0, log_mag=-inf — regardless of what raw value the user
+    asked to pad with. We pad sign with 0 and log_mag with LOG_ZERO,
+    independently per Taylor coefficient via vmap.
+    """
+    operand, _padding_value = primals_in
+    operand_s, _pad_s = series_in[0], series_in[1]
+    primal_out = lax.pad_p.bind(operand, _padding_value, **params)
+    pad_zero_sign = jnp.zeros((), dtype=operand_s.sign.dtype)
+    pad_zero_log = jnp.full((), LOG_ZERO, dtype=operand_s.log_mag.dtype)
+    sign_out = jax.vmap(
+        lambda s: lax.pad_p.bind(s, pad_zero_sign, **params))(operand_s.sign)
+    log_out = jax.vmap(
+        lambda s: lax.pad_p.bind(s, pad_zero_log, **params))(operand_s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.pad_p] = _pad_log_rule
+
+
+def _gather_log_rule(primals_in, series_in, **params):
+    """``gather(operand, start_indices, ...)``. start_indices are
+    integer-typed and have no derivatives; vmap the operand."""
+    operand, start_indices = primals_in
+    operand_s = series_in[0]
+    primal_out = lax.gather_p.bind(operand, start_indices, **params)
+    sign_out = jax.vmap(
+        lambda s: lax.gather_p.bind(s, start_indices, **params))(operand_s.sign)
+    log_out = jax.vmap(
+        lambda s: lax.gather_p.bind(s, start_indices, **params))(operand_s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.gather_p] = _gather_log_rule
+
+
+def _device_put_log_rule(primals_in, series_in, **params):
+    """``device_put`` — keep the primal where it is, but copy the series
+    fields with the same params."""
+    from jax._src import dispatch as _dispatch
+    (operand,) = primals_in
+    operand_s = series_in[0]
+    primal_out = _dispatch.device_put_p.bind(operand, **params)
+    sign_out = jax.vmap(
+        lambda s: _dispatch.device_put_p.bind(s, **params))(operand_s.sign)
+    log_out = jax.vmap(
+        lambda s: _dispatch.device_put_p.bind(s, **params))(operand_s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+def _register_device_put():
+    from jax._src import dispatch as _dispatch
+    log_space_rules[_dispatch.device_put_p] = _device_put_log_rule
+
+
+_register_device_put()
+
+
+# ---------------------------------------------------------------------------
+# Zero-propagation: predicate / boolean / integer ops whose output has
+# no Taylor information (the prim discards continuous structure).
+# ---------------------------------------------------------------------------
+
+def _zero_log_rule(prim):
+    """Output series is structural zero (sign=0, log_mag=-inf) at every
+    Taylor coefficient with the shape of the primal output.
+    """
+    def wrapped(primals_in, series_in, **params):
+        primal_out = prim.bind(*primals_in, **params)
+        # Order n is determined by the leading axis of an input series.
+        n = series_in[0].sign.shape[0]
+        out_shape = jnp.shape(primal_out)
+        # Use float64 for the log fields; sign uses the same float dtype
+        # so downstream ops don't have to special-case dtype mismatches.
+        # (For boolean primal_out, we still produce float series; that's
+        # fine because zero_series is only ever consumed by nothing in
+        # practice, and downstream primitives that *do* receive it
+        # demote it through the dispatch layer's dtype handling.)
+        dtype = jnp.float64
+        sign = jnp.zeros((n,) + out_shape, dtype=dtype)
+        log_mag = jnp.full((n,) + out_shape, LOG_ZERO, dtype=dtype)
+        return primal_out, LogSeries(sign=sign, log_mag=log_mag)
+    return wrapped
+
+
+def _register_zero_props():
+    """Register all zero-propagation primitives. Done in a function so
+    the import of ad_util is local to this scope and we don't pollute
+    the module namespace."""
+    from jax._src import ad_util
+    zero_prims = [
+        lax.le_p, lax.lt_p, lax.gt_p, lax.ge_p, lax.eq_p, lax.ne_p,
+        lax.not_p, lax.and_p, lax.or_p, lax.xor_p,
+        lax.floor_p, lax.ceil_p, lax.round_p, lax.sign_p,
+        ad_util.stop_gradient_p,
+        lax.is_finite_p,
+        lax.shift_left_p, lax.shift_right_arithmetic_p,
+        lax.shift_right_logical_p,
+        lax.bitcast_convert_type_p,
+    ]
+    for prim in zero_prims:
+        log_space_rules[prim] = _zero_log_rule(prim)
+
+
+_register_zero_props()
+
+
+# ---------------------------------------------------------------------------
+# select_n_p — predicate-based select. The predicate is a primal (no
+# series); each branch carries a LogSeries. Output picks each field
+# from the appropriate branch via lax.select_n on (sign, log_mag).
+# ---------------------------------------------------------------------------
+
+def _select_n_log_rule(primals_in, series_in, **params):
+    pred, *cases_p = primals_in
+    cases_s = series_in[1:]
+    primal_out = lax.select_n(pred, *cases_p)
+
+    def per_field(field_name):
+        case_fields = [getattr(s, field_name) for s in cases_s]
+        return jax.vmap(lambda *xs: lax.select_n(pred, *xs))(*case_fields)
+
+    return primal_out, LogSeries(
+        sign=per_field("sign"), log_mag=per_field("log_mag"))
+
+
+log_space_rules[lax.select_n_p] = _select_n_log_rule
+
+
+# ---------------------------------------------------------------------------
+# abs_p — |x| in log-space.
+#
+# For the primal: |x|. For each series coefficient k, the Taylor rule
+# for abs is "multiply by sign(primal)" (the function is locally linear
+# away from zero, with derivative ±1). In our LogSeries representation
+# that's: out.sign[k] = primal_sign * series.sign[k]; log_mag unchanged.
+# ---------------------------------------------------------------------------
+
+def _abs_log_rule(primals_in, series_in, **params):
+    (x,) = primals_in
+    (s,) = series_in
+    primal_out = lax.abs_p.bind(x, **params)
+    primal_sign = jnp.sign(x)                   # +1, -1, or 0
+    # Broadcast primal_sign over the series axis.
+    primal_sign_b = jnp.broadcast_to(primal_sign[None], s.sign.shape)
+    return primal_out, LogSeries(
+        sign=primal_sign_b * s.sign,
+        log_mag=s.log_mag,
+    )
+
+
+log_space_rules[lax.abs_p] = _abs_log_rule
+
+
+# ---------------------------------------------------------------------------
+# Reductions that are linear in their values.
+#
+# reduce_sum: collapse the reduced axes via signed logsumexp on each
+# Taylor coefficient. Note the series axis is *axis 0*; user-specified
+# reduction axes refer to primal axes, which become +1 in the series
+# view (so we shift `axes` by +1).
+# ---------------------------------------------------------------------------
+
+def _reduce_sum_log_rule(primals_in, series_in, *, axes, **params):
+    (operand,) = primals_in
+    (s,) = series_in
+    primal_out = lax.reduce_sum_p.bind(operand, axes=axes, **params)
+    # Reduce each Taylor coefficient along the same primal axes — these
+    # are axes (a+1 for a in axes) in the (n, ...) series view.
+    series_axes = tuple(a + 1 for a in axes)
+
+    def reduce_one_coef(sign_k, log_k):
+        # Reduce a single coefficient (shape = primal shape) by summing
+        # via signed logsumexp along `axes`.
+        # Implement by collapsing one axis at a time using log_sum (which
+        # only takes a single axis). Sort axes descending so axis indices
+        # stay valid while we collapse.
+        ls = LogSeries(sign=sign_k, log_mag=log_k)
+        for a in sorted(axes, reverse=True):
+            ls = log_sum(ls, axis=a)
+        return ls.sign, ls.log_mag
+
+    sign_out, log_out = jax.vmap(reduce_one_coef)(s.sign, s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.reduce_sum_p] = _reduce_sum_log_rule
+
+
+def _reduce_window_sum_log_rule(primals_in, series_in, **params):
+    """``reduce_window_sum`` over a sliding window. For each Taylor
+    coefficient we run the same windowed sum in log-space. Implemented
+    by falling through to raw arithmetic on an exp-shifted slice; this
+    is precision-lossy at deep underflow but reduce_window_sum is rare
+    in differentiable copula code."""
+    (operand,) = primals_in
+    (s,) = series_in
+    primal_out = lax.reduce_window_sum_p.bind(operand, **params)
+
+    def per_coef(sign_k, log_k):
+        # M = max(log_k) over reduce-window; not directly available, so
+        # use the global max as a safe shift. This loses some precision
+        # but keeps values in finite range.
+        M = jnp.max(jnp.where(jnp.isneginf(log_k),
+                              jnp.full_like(log_k, -jnp.inf), log_k))
+        M_safe = jnp.where(jnp.isneginf(M), jnp.zeros_like(M), M)
+        scaled = sign_k * jnp.exp(log_k - M_safe)
+        windowed = lax.reduce_window_sum_p.bind(scaled, **params)
+        new_sign = jnp.sign(windowed)
+        abs_w = jnp.abs(windowed)
+        new_log = jnp.where(abs_w > 0, M_safe + jnp.log(abs_w),
+                            jnp.full_like(abs_w, LOG_ZERO))
+        return new_sign, new_log
+
+    sign_out, log_out = jax.vmap(per_coef)(s.sign, s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.reduce_window_sum_p] = _reduce_window_sum_log_rule
+
+
+def _cumsum_log_rule(primals_in, series_in, *, axis, reverse, **params):
+    """``cumsum`` along ``axis``. We delegate to associative_scan with
+    log-space addition, which the dispatcher will trace through using
+    the already-registered add_p rule.
+
+    NOTE: We use ``jax.lax.associative_scan`` with raw addition on the
+    *primal*; for the series we rebuild the cumulative log-sum
+    coefficient-by-coefficient via a Python-side scan in log-space.
+    For the simple non-reverse case this reduces to repeated log_add.
+    """
+    (operand,) = primals_in
+    (s,) = series_in
+    primal_out = lax.cumsum_p.bind(operand, axis=axis, reverse=reverse, **params)
+
+    def per_coef(sign_k, log_k):
+        ls = LogSeries(sign=sign_k, log_mag=log_k)
+        # Roll axis to the front for an easy lax.scan.
+        sign_t = jnp.moveaxis(ls.sign, axis, 0)
+        log_t = jnp.moveaxis(ls.log_mag, axis, 0)
+        if reverse:
+            sign_t = sign_t[::-1]
+            log_t = log_t[::-1]
+
+        def body(carry, x):
+            c_sign, c_log = carry
+            x_sign, x_log = x
+            new = log_add(LogSeries(sign=c_sign, log_mag=c_log),
+                          LogSeries(sign=x_sign, log_mag=x_log))
+            return (new.sign, new.log_mag), (new.sign, new.log_mag)
+
+        zero_sign = jnp.zeros_like(sign_t[0])
+        zero_log = jnp.full_like(log_t[0], LOG_ZERO)
+        _, (out_sign_t, out_log_t) = lax.scan(
+            body, (zero_sign, zero_log), (sign_t, log_t))
+        if reverse:
+            out_sign_t = out_sign_t[::-1]
+            out_log_t = out_log_t[::-1]
+        out_sign = jnp.moveaxis(out_sign_t, 0, axis)
+        out_log = jnp.moveaxis(out_log_t, 0, axis)
+        return out_sign, out_log
+
+    sign_out, log_out = jax.vmap(per_coef)(s.sign, s.log_mag)
+    return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
+
+
+log_space_rules[lax.cumsum_p] = _cumsum_log_rule
+
+
+# ---------------------------------------------------------------------------
+# add_jaxvals_p — internal alias of add. JAX uses it for tangent-bundle
+# arithmetic; aliasing add_p's rule covers it.
+# ---------------------------------------------------------------------------
+
+def _register_add_jaxvals():
+    from jax._src import ad_util
+    log_space_rules[ad_util.add_jaxvals_p] = log_space_rules[lax.add_p]
+
+
+_register_add_jaxvals()
+
+
+# ---------------------------------------------------------------------------
+# Chooser primitives: max_p, min_p, reduce_max_p, reduce_min_p.
+#
+# These pick a winning element by comparison, then propagate the chosen
+# element's series. In log-space, the comparison is done on the raw
+# primal values; we then select the corresponding (sign, log_mag) pair
+# coefficient-by-coefficient.
+# ---------------------------------------------------------------------------
+
+def _binary_chooser_log_rule(prim, choose_max: bool):
+    """Pointwise max/min between two operands."""
+    def wrapped(primals_in, series_in, **params):
+        x, y = primals_in
+        sx, sy = series_in
+        primal_out = prim.bind(x, y, **params)
+        if choose_max:
+            x_wins = x > y
+            ties = x == y
+        else:
+            x_wins = x < y
+            ties = x == y
+        x_wins_b = jnp.broadcast_to(x_wins[None], sx.sign.shape)
+        ties_b = jnp.broadcast_to(ties[None], sx.sign.shape)
+
+        # On ties, the standard convention (matches raw _lax_max/min)
+        # is to average the two operands' series; in log-space we use
+        # log_add(sx, sy) / 2 = log_add(sx, sy) - log(2).
+        avg = log_add(sx, sy)
+        log2 = LogSeries(
+            sign=jnp.ones_like(avg.sign),
+            log_mag=jnp.full_like(avg.log_mag, jnp.log(2.0)),
+        )
+        avg = log_div(avg, log2)
+
+        sign_pick = jnp.where(x_wins_b, sx.sign, sy.sign)
+        log_pick = jnp.where(x_wins_b, sx.log_mag, sy.log_mag)
+        sign_out = jnp.where(ties_b, avg.sign, sign_pick)
+        log_out = jnp.where(ties_b, avg.log_mag, log_pick)
         return primal_out, LogSeries(sign=sign_out, log_mag=log_out)
     return wrapped
 
 
-log_space_rules[lax.convert_element_type_p] = _wrap_structural_unary(
-    lax.convert_element_type_p)
-log_space_rules[lax.broadcast_in_dim_p] = _wrap_structural_unary(
-    lax.broadcast_in_dim_p)
-log_space_rules[lax.reshape_p] = _wrap_structural_unary(lax.reshape_p)
-log_space_rules[lax.squeeze_p] = _wrap_structural_unary(lax.squeeze_p)
-log_space_rules[lax.transpose_p] = _wrap_structural_unary(lax.transpose_p)
+log_space_rules[lax.max_p] = _binary_chooser_log_rule(lax.max_p, choose_max=True)
+log_space_rules[lax.min_p] = _binary_chooser_log_rule(lax.min_p, choose_max=False)
+
+
+def _reduce_chooser_log_rule(prim, chooser_fun):
+    """``reduce_max`` / ``reduce_min`` along ``axes``.
+
+    For each Taylor coefficient we compute the average of the series
+    values where the primal achieves its extremum (matching the raw
+    ``_gen_reduce_choose_taylor_rule``), all in log-space."""
+    def wrapped(primals_in, series_in, *, axes, **params):
+        (operand,) = primals_in
+        (s,) = series_in
+        primal_out = chooser_fun(operand, axes=axes, **params)
+        # Re-broadcast primal_out back so we can compare elementwise.
+        # Same trick as raw: keep the reduced dims as size-1 axes via
+        # reshape, then compare with operand to mark winner positions.
+        keep_shape = [1 if i in axes else d
+                      for i, d in enumerate(operand.shape)]
+        primal_b = lax.reshape(primal_out, keep_shape)
+        location = (operand == primal_b).astype(s.log_mag.dtype)
+        # location has same shape as operand; broadcast to series.
+        location_b = jnp.broadcast_to(location[None], s.sign.shape)
+        # Mask each coefficient: keep entries at winner positions, set
+        # others to structural zero so log_sum picks them up cleanly.
+        masked_sign = s.sign * location_b
+        masked_log = jnp.where(
+            location_b > 0, s.log_mag,
+            jnp.full_like(s.log_mag, LOG_ZERO))
+        masked = LogSeries(sign=masked_sign, log_mag=masked_log)
+        # Sum the masked series along the reduce axes (shifted +1 for
+        # series axis), divide by count of winners.
+        counts = lax.reduce_sum(location, axes)
+        counts_log = LogSeries(
+            sign=jnp.sign(counts),
+            log_mag=jnp.where(counts > 0, jnp.log(counts),
+                              jnp.full_like(counts, LOG_ZERO)),
+        )
+
+        def reduce_one_coef(sign_k, log_k):
+            ls = LogSeries(sign=sign_k, log_mag=log_k)
+            for a in sorted(axes, reverse=True):
+                ls = log_sum(ls, axis=a)
+            return ls.sign, ls.log_mag
+
+        sum_sign, sum_log = jax.vmap(reduce_one_coef)(
+            masked.sign, masked.log_mag)
+        # Divide by count (broadcast counts_log over series axis).
+        counts_log_b = LogSeries(
+            sign=jnp.broadcast_to(counts_log.sign[None], sum_sign.shape),
+            log_mag=jnp.broadcast_to(counts_log.log_mag[None], sum_log.shape),
+        )
+        out = log_div(LogSeries(sign=sum_sign, log_mag=sum_log), counts_log_b)
+        return primal_out, out
+    return wrapped
+
+
+log_space_rules[lax.reduce_max_p] = _reduce_chooser_log_rule(
+    lax.reduce_max_p, lax.reduce_max)
+log_space_rules[lax.reduce_min_p] = _reduce_chooser_log_rule(
+    lax.reduce_min_p, lax.reduce_min)
+
+
+# ---------------------------------------------------------------------------
+# Generic "convert to raw, apply raw rule, convert back" fallback.
+#
+# For primitives where a faithful log-space recurrence is heavyweight
+# (trig, erf, tanh, logistic, dot_general, conv) but correctness
+# matters, we convert each series LogSeries to raw float, hand off to
+# the existing raw `jet_rules` entry, and convert the result back. The
+# precision loss is at the conversion boundary — this is acceptable
+# when the values are in O(1) range (typical for trig/erf) and when
+# the dominant log-space stability concern is the *outer* recurrence
+# (Faà-di-Bruno-style products in copula generators), which still
+# benefits from the surrounding log-space pipeline.
+# ---------------------------------------------------------------------------
+
+def _wrap_via_raw(prim):
+    """Adapt a raw jet-rule into a log-space rule by converting
+    LogSeries→raw→apply→raw→LogSeries. Looks up the raw rule on demand
+    from `jet_array.jet_rules` so we don't import it at module-init."""
+    def wrapped(primals_in, series_in, **params):
+        from . import jet_rules
+        raw_series = tuple(log_to_raw(s) for s in series_in)
+        primal_out, series_out_raw = jet_rules[prim](
+            primals_in, raw_series, **params)
+        if isinstance(series_out_raw, tuple):
+            series_out = tuple(raw_to_log(so) for so in series_out_raw)
+        else:
+            series_out = raw_to_log(series_out_raw)
+        return primal_out, series_out
+    return wrapped
+
+
+def _register_via_raw_fallbacks():
+    fallback_prims = [
+        # Trig
+        lax.sin_p, lax.cos_p, lax.sinh_p, lax.cosh_p,
+        # Sigmoid family
+        lax.tanh_p, lax.logistic_p,
+        # Special
+        lax.erf_p, lax.erf_inv_p,
+        # Bilinear: contraction inside is hard in pure log-space; the
+        # raw rule does a Cauchy-product scan that we can re-use.
+        lax.dot_general_p, lax.conv_general_dilated_p,
+    ]
+    for prim in fallback_prims:
+        log_space_rules[prim] = _wrap_via_raw(prim)
+
+
+_register_via_raw_fallbacks()

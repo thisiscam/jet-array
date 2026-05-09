@@ -207,12 +207,8 @@ def test_log_div_zero_numerator():
     (lambda x: jnp.expm1(-x), 0.7),
     # Frank generator at moderate t
     (lambda x: -jnp.log1p(jnp.exp(-x) * jnp.expm1(-1.5)) / 1.5, 2.0),
-    # Joe generator (excluded — uses lax.pow_p with non-integer exponent
-    # which has no log-space rule yet; integer_pow is supported)
-    pytest.param(lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / 2.0), 1.2,
-                 marks=pytest.mark.xfail(
-                     reason="lax.pow_p (non-integer exponent) "
-                            "not yet ported to log-space")),
+    # Joe generator — exercises lax.pow_p with non-integer exponent
+    (lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / 2.0), 1.2),
 ])
 def test_jet_log_space_matches_raw_smooth(fn, arg):
     """Forward output of jet(log_space=True) must match jet(log_space=False)
@@ -271,3 +267,115 @@ def test_jet_log_space_grad_matches_raw_finite_case():
     g_raw = jax.grad(loss_raw)(jnp.float64(1.5))
     g_log = jax.grad(loss_log)(jnp.float64(1.5))
     np.testing.assert_allclose(g_log, g_raw, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# pow_p — non-integer exponent. The log-space rule is u**r = exp(r*log(u))
+# wired through the same exp-recurrence as `_exp_taylor_rule_log`. We check:
+#   * forward output matches the raw rule across a grid of (base, exponent)
+#     including positive-fractional, negative-fractional, and traced-exponent
+#     cases (where JAX lowers to lax.pow_p rather than lax.integer_pow_p);
+#   * the gradient of a high-order coefficient w.r.t. an input parameter
+#     matches the raw rule, exercising the backward path;
+#   * a Joe generator at large d (where raw underflows) gives a finite
+#     answer in log-space.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("fn,arg", [
+    # Joe generator: phi(t) = 1 - (1 - exp(-t))^(1/theta)
+    (lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / 1.5), 0.7),
+    (lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / 1.5), 2.5),
+    # Clayton-style: (1 + u)^(-1/theta) — negative fractional exponent.
+    (lambda x: jnp.power(1.0 + x, -1.0 / 2.5), 0.4),
+    (lambda x: jnp.power(1.0 + x, -1.0 / 2.5), 3.0),
+    # Outer-power composition: phi_base(t)^r at r=0.7
+    (lambda x: jnp.power(jnp.exp(-x), 0.7), 1.1),
+    # Non-integer positive exponent, base from log1p (positive everywhere
+    # x > -1).
+    (lambda x: jnp.power(jnp.log1p(x) + 1.0, 1.7), 0.5),
+])
+def test_pow_p_log_space_matches_raw(fn, arg):
+    n = 12
+    series = jnp.zeros(n).at[0].set(1.0)
+    p_raw, s_raw = jet(fn, (jnp.float64(arg),), (series,))
+    p_log, s_log = jet(fn, (jnp.float64(arg),), (series,), log_space=True)
+    np.testing.assert_allclose(p_log, p_raw, rtol=1e-12)
+    rel = jnp.where(jnp.abs(s_raw) > 1e-280,
+                    jnp.abs(s_log - s_raw) / jnp.abs(s_raw),
+                    jnp.abs(s_log - s_raw))
+    assert float(jnp.max(rel)) < 1e-11, \
+        f"fn={fn} arg={arg} max_rel={float(jnp.max(rel))}"
+
+
+def test_pow_p_traced_exponent_matches_raw():
+    """When the exponent is itself a traced value (a function of the jet
+    input), JAX lowers `x**y` to `lax.pow_p` with both args carrying
+    derivatives. Both base and exponent feed nontrivial series into
+    `_pow_taylor_rule_log` via `_mul_taylor_rule_log(r, log(u))`."""
+    n = 8
+
+    # f(x) = (1 + sin-like-positive-shift x) ** (0.5 + 0.3 x)
+    # Both base and exponent depend on x, so the exponent's series is
+    # nonzero (this is the path raw `_pow_taylor` also takes).
+    def fn(x):
+        base = 1.0 + 0.5 * jnp.expm1(x)         # > 0 for x near 0
+        expnt = 0.5 + 0.3 * x
+        return jnp.power(base, expnt)
+
+    series = jnp.zeros(n).at[0].set(1.0)
+    arg = jnp.float64(0.4)
+
+    p_raw, s_raw = jet(fn, (arg,), (series,))
+    p_log, s_log = jet(fn, (arg,), (series,), log_space=True)
+    np.testing.assert_allclose(p_log, p_raw, rtol=1e-12)
+    rel = jnp.where(jnp.abs(s_raw) > 1e-280,
+                    jnp.abs(s_log - s_raw) / jnp.abs(s_raw),
+                    jnp.abs(s_log - s_raw))
+    assert float(jnp.max(rel)) < 1e-11, \
+        f"max_rel={float(jnp.max(rel))}"
+
+
+def test_pow_p_grad_matches_raw():
+    """Gradient of a high-order Taylor coefficient w.r.t. the exponent
+    parameter (Joe-style theta) matches between raw and log paths at an
+    order where raw is still finite. This exercises the backward path
+    through `_log_taylor_rule_log`, `_mul_taylor_rule_log`, and
+    `_exp_propagate_log`."""
+    n = 10
+    series = jnp.zeros(n).at[0].set(1.0)
+    t = jnp.float64(0.7)
+
+    def coef_raw(theta):
+        fn = lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / theta)
+        _, s = jet(fn, (t,), (series,))
+        return s[-1]
+
+    def coef_log(theta):
+        fn = lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / theta)
+        _, s = jet(fn, (t,), (series,), log_space=True)
+        return s[-1]
+
+    theta0 = jnp.float64(1.6)
+    np.testing.assert_allclose(coef_log(theta0), coef_raw(theta0), rtol=1e-11)
+    g_raw = jax.grad(coef_raw)(theta0)
+    g_log = jax.grad(coef_log)(theta0)
+    np.testing.assert_allclose(g_log, g_raw, rtol=1e-10)
+
+
+def test_pow_p_log_space_finite_where_raw_underflows():
+    """At high derivative order on a Joe-style generator, raw float64
+    underflows the late coefficients to ±denormal/0; log-space carries
+    them as finite (sign, log_mag) pairs and produces a finite gradient."""
+    n = 80                                       # deep enough to underflow raw
+    series = jnp.zeros(n).at[0].set(1.0)
+    t = jnp.float64(3.0)
+
+    def loss_log(theta):
+        fn = lambda x: 1.0 - jnp.power(1.0 - jnp.exp(-x), 1.0 / theta)
+        _, s = jet(fn, (t,), (series,), log_space=True,
+                   return_log_series=True)
+        # log|s[-1]| in log-space is a single subtraction, never NaN.
+        return s.log_mag[-1]
+
+    g_log = jax.grad(loss_log)(jnp.float64(1.6))
+    assert jnp.isfinite(g_log), f"log-space grad not finite: {g_log}"
